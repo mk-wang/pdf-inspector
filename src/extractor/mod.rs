@@ -21,7 +21,7 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items;
+use content_stream::extract_page_text_items_with_limit;
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -162,7 +162,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None)
+    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None, None)
 }
 
 /// Extract selected pages and gather document-wide folio evidence only when a
@@ -173,7 +173,22 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
+    extract_positioned_text_with_folio_context_with_limit(doc, font_cmaps, page_filter, None)
+}
+
+pub(crate) fn extract_positioned_text_with_folio_context_with_limit(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    max_decompressed_size: Option<usize>,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        max_decompressed_size,
+    )
 }
 
 /// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
@@ -182,7 +197,27 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
+    extract_positioned_text_include_invisible_with_folio_context_with_limit(
+        doc,
+        font_cmaps,
+        page_filter,
+        None,
+    )
+}
+
+pub(crate) fn extract_positioned_text_include_invisible_with_folio_context_with_limit(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    max_decompressed_size: Option<usize>,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        true,
+        max_decompressed_size,
+    )
 }
 
 fn extract_positioned_text_with_folio_context_impl(
@@ -190,9 +225,17 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
+    max_decompressed_size: Option<usize>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     let Some(required_pages) = page_filter else {
-        return extract_positioned_text_impl(doc, font_cmaps, None, include_invisible, None);
+        return extract_positioned_text_impl(
+            doc,
+            font_cmaps,
+            None,
+            include_invisible,
+            None,
+            max_decompressed_size,
+        );
     };
 
     let (
@@ -205,6 +248,7 @@ fn extract_positioned_text_with_folio_context_impl(
         Some(required_pages),
         include_invisible,
         None,
+        max_decompressed_size,
     )?;
     if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
         return Ok((
@@ -227,6 +271,7 @@ fn extract_positioned_text_with_folio_context_impl(
             Some(&context_pages),
             include_invisible,
             Some(required_pages),
+            max_decompressed_size,
         )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
@@ -247,7 +292,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
+    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages), None)
 }
 
 fn extract_positioned_text_impl(
@@ -256,6 +301,7 @@ fn extract_positioned_text_impl(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
+    max_decompressed_size: Option<usize>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
@@ -277,7 +323,7 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let page_result = extract_page_text_items(
+        let page_result = extract_page_text_items_with_limit(
             doc,
             page_id,
             *page_num,
@@ -285,12 +331,14 @@ fn extract_positioned_text_impl(
             include_invisible,
             &mut style_cache,
             &mut FormWalkBudget::new(),
+            max_decompressed_size,
         );
         let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
             match page_result {
                 Ok(extraction) => extraction,
                 Err(error)
-                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
+                    if required_pages.is_some_and(|required| !required.contains(page_num))
+                        && !error.is_decompression_limit() =>
                 {
                     debug!(
                         "page {}: skipping context-only extraction error: {}",

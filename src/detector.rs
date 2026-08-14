@@ -186,6 +186,15 @@ pub(crate) fn detect_from_document(
     page_count: u32,
     config: &DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    detect_from_document_with_limit(doc, page_count, config, None)
+}
+
+pub(crate) fn detect_from_document_with_limit(
+    doc: &Document,
+    page_count: u32,
+    config: &DetectionConfig,
+    max_decompressed_size: Option<usize>,
+) -> Result<PdfTypeResult, PdfError> {
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
 
@@ -220,7 +229,8 @@ pub(crate) fn detect_from_document(
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content(doc, page_id);
+            let analysis =
+                analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -389,7 +399,8 @@ pub(crate) fn detect_from_document(
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content(doc, page_id);
+                    let a =
+                        analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -435,7 +446,8 @@ pub(crate) fn detect_from_document(
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content(doc, page_id);
+                let analysis =
+                    analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -733,6 +745,15 @@ fn resolve_with_shadowing(
 
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
+    analyze_page_content_with_limit(doc, page_id, None)
+        .expect("unbounded detector recovery never returns a size error")
+}
+
+fn analyze_page_content_with_limit(
+    doc: &Document,
+    page_id: ObjectId,
+    max_decompressed_size: Option<usize>,
+) -> Result<PageAnalysis, PdfError> {
     let mut text_ops = 0u32;
     let mut has_images = false;
     let mut image_count = 0u32;
@@ -758,10 +779,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
+            let content =
+                crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
@@ -804,7 +823,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
-            );
+                max_decompressed_size,
+            )?;
             text_ops += ops;
             image_count += imgs;
             path_ops += paths;
@@ -821,7 +841,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
-                );
+                    max_decompressed_size,
+                )?;
                 text_ops += ops;
                 image_count += imgs;
                 path_ops += paths;
@@ -857,8 +878,13 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
     // Only consider fonts actually USED by Tf operators in content streams (P1 fix),
     // and include fonts from Form XObject Resources (P2 fix).
-    let has_identity_h_no_tounicode =
-        text_ops > 0 && used_fonts_have_identity_h_no_tounicode(&used_font_ids, &font_map, doc);
+    let has_identity_h_no_tounicode = text_ops > 0
+        && used_fonts_have_identity_h_no_tounicode(
+            &used_font_ids,
+            &font_map,
+            doc,
+            max_decompressed_size,
+        )?;
 
     // Check for Type3-only fonts — glyph bitmaps without Unicode mapping.
     // Uses the usage-based font set for accuracy.
@@ -868,10 +894,15 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // CID-encoded fonts with ToUnicode produce low unique_alphanum_chars in raw
     // bytes but are fully decodable — we need this to avoid false scan detection.
     // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
-    let has_decodable_text_fonts =
-        text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
+    let has_decodable_text_fonts = text_ops > 0
+        && used_fonts_have_decodable_text(
+            &used_font_ids,
+            &font_map,
+            doc,
+            max_decompressed_size,
+        )?;
 
-    PageAnalysis {
+    Ok(PageAnalysis {
         text_operator_count: text_ops,
         has_images,
         has_template_image,
@@ -885,7 +916,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_only_type3_fonts,
         font_change_count: font_changes,
         has_decodable_text_fonts,
-    }
+    })
 }
 
 /// Check if a page has Type0 fonts with Identity-H/V encoding and no ToUnicode CMap.
@@ -971,34 +1002,42 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
 /// Check whether an Identity-H font without ToUnicode can still be decoded
 /// via one of the extraction pipeline's fallback paths.
 fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
+    identity_h_font_has_fallback_with_limit(font_dict, doc, None).unwrap_or(false)
+}
+
+fn identity_h_font_has_fallback_with_limit(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> Result<bool, PdfError> {
     let desc_fonts_obj = match font_dict.get(b"DescendantFonts").ok() {
         Some(obj) => obj,
-        None => return false,
+        None => return Ok(false),
     };
     let desc_fonts = match desc_fonts_obj {
         Object::Array(arr) => arr,
         Object::Reference(r) => match doc.get_object(*r) {
             Ok(Object::Array(arr)) => arr,
-            _ => return false,
+            _ => return Ok(false),
         },
-        _ => return false,
+        _ => return Ok(false),
     };
-    if desc_fonts.is_empty() {
-        return false;
-    }
-    let cid_font_dict = match &desc_fonts[0] {
+    let Some(cid_font) = desc_fonts.first() else {
+        return Ok(false);
+    };
+    let cid_font_dict = match cid_font {
         Object::Reference(r) => match doc.get_dictionary(*r) {
             Ok(d) => d,
-            _ => return false,
+            _ => return Ok(false),
         },
         Object::Dictionary(d) => d,
-        _ => return false,
+        _ => return Ok(false),
     };
 
     // Fallback 1: W array CIDs look like Unicode codepoints → passthrough works.
     // Many PDF generators (Chromium, wkhtmltopdf) use Identity-H where CID = Unicode.
     if crate::tounicode::cid_values_look_like_unicode(cid_font_dict) {
-        return true;
+        return Ok(true);
     }
 
     // Fallback 2: Embedded TrueType/OpenType font has a usable cmap table.
@@ -1022,29 +1061,40 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
                     .and_then(|o| o.as_reference().ok())
             });
         if let Some(ff_ref) = font_file_ref {
-            if embedded_font_has_cmap(doc, ff_ref) {
-                return true;
+            if embedded_font_has_cmap_with_limit(doc, ff_ref, max_decompressed_size)? {
+                return Ok(true);
             }
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Quick check whether an embedded TrueType/OpenType font has a cmap table
 /// that can map GIDs to Unicode codepoints.
 fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
+    embedded_font_has_cmap_with_limit(doc, font_ref, None).unwrap_or(false)
+}
+
+fn embedded_font_has_cmap_with_limit(
+    doc: &Document,
+    font_ref: lopdf::ObjectId,
+    max_decompressed_size: Option<usize>,
+) -> Result<bool, PdfError> {
     let stream = match doc.get_object(font_ref).and_then(Object::as_stream) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
-    let data = match stream.decompressed_content() {
-        Ok(d) => d,
-        Err(_) => return false,
+    let data = match crate::decompressed_stream_content(stream, max_decompressed_size) {
+        Ok(data) => data,
+        Err(error @ lopdf::Error::Decompress(
+            lopdf::DecompressError::MemoryLimitExceeded { .. },
+        )) => return Err(error.into()),
+        Err(_) => return Ok(false),
     };
     let face = match ttf_parser::Face::parse(&data, 0) {
         Ok(f) => f,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
     // Check that the font has a cmap table with at least some Unicode mappings
     if let Some(cmap) = face.tables().cmap {
@@ -1056,12 +1106,12 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
                 let mut count = 0u32;
                 subtable.codepoints(|_| count += 1);
                 if count > 0 {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Returns true if every font on the page is Type3 (no normal text fonts).
@@ -1158,7 +1208,8 @@ fn used_fonts_have_identity_h_no_tounicode(
     used_font_ids: &HashSet<ObjectId>,
     font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
-) -> bool {
+    max_decompressed_size: Option<usize>,
+) -> Result<bool, PdfError> {
     let mut has_undecodable_identity_h = false;
     let mut has_other_decodable_font = false;
 
@@ -1180,7 +1231,11 @@ fn used_fonts_have_identity_h_no_tounicode(
                     has_other_decodable_font = true;
                     continue;
                 }
-                if identity_h_font_has_fallback(&info.dict, doc) {
+                if identity_h_font_has_fallback_with_limit(
+                    &info.dict,
+                    doc,
+                    max_decompressed_size,
+                )? {
                     has_other_decodable_font = true;
                     continue;
                 }
@@ -1196,7 +1251,7 @@ fn used_fonts_have_identity_h_no_tounicode(
         }
     }
 
-    has_undecodable_identity_h && !has_other_decodable_font
+    Ok(has_undecodable_identity_h && !has_other_decodable_font)
 }
 
 /// Usage-based check: are ALL used fonts Type3 without ToUnicode?
@@ -1236,27 +1291,32 @@ fn used_fonts_have_decodable_text(
     used_font_ids: &HashSet<ObjectId>,
     font_map: &HashMap<ObjectId, FontInfo>,
     doc: &Document,
-) -> bool {
+    max_decompressed_size: Option<usize>,
+) -> Result<bool, PdfError> {
     for id in used_font_ids {
         let Some(info) = font_map.get(id) else {
             continue;
         };
         if info.has_tounicode {
-            return true;
+            return Ok(true);
         }
         match info.subtype.as_deref() {
             Some(b"Type1") | Some(b"TrueType") | Some(b"MMType1") => {
-                return true;
+                return Ok(true);
             }
             Some(b"Type0") => {
-                if identity_h_font_has_fallback(&info.dict, doc) {
-                    return true;
+                if identity_h_font_has_fallback_with_limit(
+                    &info.dict,
+                    doc,
+                    max_decompressed_size,
+                )? {
+                    return Ok(true);
                 }
             }
             _ => {}
         }
     }
-    false
+    Ok(false)
 }
 
 fn scan_xobjects_in_resources(
@@ -1266,7 +1326,8 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
-) -> (u32, u32, u32, u32) {
+    max_decompressed_size: Option<usize>,
+) -> Result<(u32, u32, u32, u32), PdfError> {
     let mut text_ops = 0u32;
     let mut image_count = 0u32;
     let mut path_ops = 0u32;
@@ -1296,9 +1357,8 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                    let content =
+                        crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
                     let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
@@ -1338,7 +1398,8 @@ fn scan_xobjects_in_resources(
                             unique_chars,
                             used_font_ids,
                             font_map,
-                        );
+                            max_decompressed_size,
+                        )?;
                         text_ops += ops2;
                         image_count += imgs2;
                         path_ops += paths2;
@@ -1353,7 +1414,7 @@ fn scan_xobjects_in_resources(
         }
     }
 
-    (text_ops, image_count, path_ops, font_changes)
+    Ok((text_ops, image_count, path_ops, font_changes))
 }
 
 /// Fast scan of content stream bytes for text operators

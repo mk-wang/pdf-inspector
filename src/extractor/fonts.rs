@@ -903,10 +903,10 @@ fn is_ligature_char(ch: char) -> bool {
     )
 }
 
-/// Get the CMap lookup key for an Identity-H/V CID font without ToUnicode.
+/// Get the CMap lookup key for a Type0 CID font without ToUnicode.
 /// Returns the object number used by `collect_cmaps_from_fonts` to store the CMap:
-/// - FontFile2 or FontFile3 obj_num (for embedded font cmap)
-/// - CIDFont dict obj_num (for predefined CIDSystemInfo-based mapping)
+/// - FontFile2 or FontFile3 obj_num (for an embedded font cmap)
+/// - CIDFont dict obj_num (for a predefined or encoding CMap)
 pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<u32> {
     let subtype = font_dict
         .get(b"Subtype")
@@ -915,39 +915,31 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
 
     // Type0 (CID) fonts
     if subtype == Some(b"Type0") {
-        let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
-        if encoding != b"Identity-H" && encoding != b"Identity-V" {
-            return None;
-        }
         let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
         let desc_fonts = resolve_array(doc, desc_fonts_obj)?;
-        if desc_fonts.is_empty() {
-            return None;
-        }
-        let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
-        let font_descriptor_obj = cid_font_dict.get(b"FontDescriptor").ok()?;
-        let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
+        let cid_font = desc_fonts.first()?;
+        let cid_font_dict = resolve_dict(doc, cid_font)?;
 
-        // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF)
-        if let Some(ff_ref) = font_descriptor
-            .get(b"FontFile2")
+        let font_file_ref = cid_font_dict
+            .get(b"FontDescriptor")
             .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
+            .and_then(|descriptor| resolve_dict(doc, descriptor))
+            .and_then(|font_descriptor| {
                 font_descriptor
-                    .get(b"FontFile3")
+                    .get(b"FontFile2")
                     .ok()
                     .and_then(|o| o.as_reference().ok())
-            })
-        {
-            return Some(ff_ref.0);
-        }
+                    .or_else(|| {
+                        font_descriptor
+                            .get(b"FontFile3")
+                            .ok()
+                            .and_then(|o| o.as_reference().ok())
+                    })
+            });
 
-        // Fallback: use DescendantFonts[0] obj_num (for predefined CIDSystemInfo mapping)
-        if let Object::Reference(r) = &desc_fonts[0] {
-            return Some(r.0);
-        }
-        return None;
+        return font_file_ref
+            .map(|reference| reference.0)
+            .or_else(|| cid_font.as_reference().ok().map(|reference| reference.0));
     }
 
     // Simple fonts: use embedded font file if available
@@ -995,6 +987,16 @@ pub(crate) fn descriptor_style_flags(
     font_dict: &lopdf::Dictionary,
     style_cache: &mut FontStyleCache,
 ) -> (bool, bool) {
+    descriptor_style_flags_with_limit(doc, font_dict, style_cache, None)
+        .expect("unbounded font style parsing never returns a size error")
+}
+
+pub(crate) fn descriptor_style_flags_with_limit(
+    doc: &Document,
+    font_dict: &lopdf::Dictionary,
+    style_cache: &mut FontStyleCache,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<(bool, bool)> {
     let descriptor = font_dict
         .get(b"FontDescriptor")
         .ok()
@@ -1007,7 +1009,7 @@ pub(crate) fn descriptor_style_flags(
             resolve_dict(doc, cid_font_dict.get(b"FontDescriptor").ok()?)
         });
     let Some(descriptor) = descriptor else {
-        return (false, false);
+        return Ok((false, false));
     };
 
     let italic_angle = descriptor
@@ -1033,38 +1035,47 @@ pub(crate) fn descriptor_style_flags(
     // fsSelection (via `Face::is_italic`) and the post table's italicAngle.
     if !italic || !bold {
         if let Some(ff_ref) = font_file_ref(descriptor) {
-            let (emb_italic, emb_bold) = *style_cache
-                .by_font_file
-                .entry(ff_ref)
-                .or_insert_with(|| embedded_style_flags(doc, ff_ref));
+            let (emb_italic, emb_bold) = match style_cache.by_font_file.get(&ff_ref) {
+                Some(style) => *style,
+                None => {
+                    let style =
+                        embedded_style_flags_with_limit(doc, ff_ref, max_decompressed_size)?;
+                    style_cache.by_font_file.insert(ff_ref, style);
+                    style
+                }
+            };
             italic = italic || emb_italic;
             bold = bold || emb_bold;
         }
     }
-    (italic, bold)
+    Ok((italic, bold))
 }
 
 /// Style flags parsed from an embedded font program stream.
-fn embedded_style_flags(doc: &Document, ff_ref: ObjectId) -> (bool, bool) {
-    let Some(data) = font_file_data(doc, ff_ref) else {
-        return (false, false);
+fn embedded_style_flags_with_limit(
+    doc: &Document,
+    ff_ref: ObjectId,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<(bool, bool)> {
+    let Some(data) = font_file_data_with_limit(doc, ff_ref, max_decompressed_size)? else {
+        return Ok((false, false));
     };
     if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
-        (
+        Ok((
             face.is_italic() || face.italic_angle().abs() >= 4.0,
             face.is_bold(),
-        )
+        ))
     } else if let Some(name) = cff_font_name(&data) {
         // FontFile3 is bare CFF (no sfnt container) — ttf_parser
         // can't open it, but the CFF Name INDEX keeps the real
         // PostScript name ("XXXXXX+Amplitude-LightItalic") even
         // when the descriptor was rewritten to claim upright.
-        (
+        Ok((
             crate::text_utils::is_italic_font(&name),
             crate::text_utils::is_bold_font(&name),
-        )
+        ))
     } else {
-        (false, false)
+        Ok((false, false))
     }
 }
 
@@ -1119,16 +1130,22 @@ fn font_file_ref(descriptor: &lopdf::Dictionary) -> Option<ObjectId> {
 }
 
 /// Decompressed embedded font program bytes.
-fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
-    let stream = doc
+fn font_file_data_with_limit(
+    doc: &Document,
+    ff_ref: ObjectId,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<Vec<u8>>> {
+    let stream = match doc
         .get_object(ff_ref)
         .and_then(lopdf::Object::as_stream)
-        .ok()?;
-    Some(
-        stream
-            .decompressed_content()
-            .unwrap_or_else(|_| stream.content.clone()),
-    )
+    {
+        Ok(stream) => stream,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(crate::decompressed_stream_content_or_raw(
+        stream,
+        max_decompressed_size,
+    )?))
 }
 
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.

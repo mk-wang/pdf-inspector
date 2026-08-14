@@ -1,9 +1,10 @@
 //! Form XObject and image XObject extraction.
 
-use super::fonts::descriptor_style_flags;
+use super::fonts::descriptor_style_flags_with_limit;
 use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, TextItem};
+use crate::PdfError;
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -178,7 +179,7 @@ fn collect_xobjects_from_dict(
     }
 }
 
-/// Extract text items from a Form XObject
+/// Extract text items from a Form XObject.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
@@ -190,6 +191,32 @@ pub(crate) fn extract_form_xobject_text(
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
 ) -> Vec<TextItem> {
+    extract_form_xobject_text_with_limit(
+        doc,
+        form_id,
+        page_num,
+        font_cmaps,
+        parent_ctm,
+        cmap_decisions,
+        style_cache,
+        budget,
+        None,
+    )
+    .expect("unbounded form extraction never returns a size error")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_form_xobject_text_with_limit(
+    doc: &Document,
+    form_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    parent_ctm: &[f32; 6],
+    cmap_decisions: &mut CMapDecisionCache,
+    style_cache: &mut FontStyleCache,
+    budget: &mut FormWalkBudget,
+    max_decompressed_size: Option<usize>,
+) -> Result<Vec<TextItem>, PdfError> {
     extract_form_xobject_text_inner(
         doc,
         form_id,
@@ -200,6 +227,7 @@ pub(crate) fn extract_form_xobject_text(
         style_cache,
         0,
         budget,
+        max_decompressed_size,
     )
 }
 
@@ -214,23 +242,21 @@ fn extract_form_xobject_text_inner(
     style_cache: &mut FontStyleCache,
     depth: u8,
     budget: &mut FormWalkBudget,
-) -> Vec<TextItem> {
+    max_decompressed_size: Option<usize>,
+) -> Result<Vec<TextItem>, PdfError> {
     let mut items = Vec::new();
 
     if !budget.charge_invocation() {
-        return items;
+        return Ok(items);
     }
 
     // Get the Form XObject stream
     let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
-        return items;
+        return Ok(items);
     };
 
-    // Decompress the content stream (fall back to raw bytes for uncompressed streams)
-    let content_data = match stream.decompressed_content() {
-        Ok(data) => data,
-        Err(_) => stream.content.clone(),
-    };
+    // Decompress the content stream (fall back to raw bytes for malformed filters).
+    let content_data = crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
 
     // Decode the content stream. Cap before lopdf materializes the operator
     // vector — the walk budget cannot help if decode itself allocates first.
@@ -238,7 +264,7 @@ fn extract_form_xobject_text_inner(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
     ) else {
-        return items;
+        return Ok(items);
     };
 
     // Get fonts from the Form's Resources
@@ -263,7 +289,8 @@ fn extract_form_xobject_text_inner(
                 font_base_names.insert(resource_name.clone(), base_name);
             }
         }
-        let style = descriptor_style_flags(doc, font_dict, style_cache);
+        let style =
+            descriptor_style_flags_with_limit(doc, font_dict, style_cache, max_decompressed_size)?;
         if style != (false, false) {
             font_style_flags.insert(resource_name.clone(), style);
         }
@@ -272,30 +299,54 @@ fn extract_form_xobject_text_inner(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
-                    if let Some(entry) =
-                        crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
-                    {
+                    let data =
+                        crate::decompressed_stream_content_or_raw(s, max_decompressed_size)?;
+                    if let Some(entry) = crate::tounicode::build_cmap_entry_from_stream_with_limit(
+                        &data,
+                        font_dict,
+                        doc,
+                        0,
+                        max_decompressed_size,
+                    )? {
                         inline_cmaps.insert(resource_name, entry);
                     }
                 }
             }
             Err(_) => {
-                if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
+                if let Some(entry) =
+                    crate::tounicode::build_cmap_entry_from_encoding_fallback_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )?
+                {
+                    inline_cmaps.insert(resource_name, entry);
+                } else if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
                     font_tounicode_refs.insert(resource_name, ff2_obj_num);
                 }
             }
         }
     }
 
-    // Cache font encodings for form fonts
+    // Cache font encodings from lopdf (once per font, not per text operand).
     let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
     for (font_name, font_dict) in &form_fonts {
         let name = String::from_utf8_lossy(font_name).to_string();
-        if let Ok(enc) = font_dict.get_font_encoding(doc) {
-            encoding_cache.insert(name, enc);
+        match max_decompressed_size {
+            Some(limit) => match font_dict.get_font_encoding_with_limit(doc, limit) {
+                Ok(encoding) => {
+                    encoding_cache.insert(name, encoding);
+                }
+                Err(error) if crate::is_decompression_limit_error(&error) => {
+                    return Err(error.into());
+                }
+                Err(_) => {}
+            },
+            None => {
+                if let Ok(encoding) = font_dict.get_font_encoding(doc) {
+                    encoding_cache.insert(name, encoding);
+                }
+            }
         }
     }
 
@@ -403,7 +454,8 @@ fn extract_form_xobject_text_inner(
                                         style_cache,
                                         depth + 1,
                                         budget,
-                                    );
+                                        max_decompressed_size,
+                                    )?;
                                     items.extend(nested_items);
                                 }
                             }
@@ -799,7 +851,7 @@ fn extract_form_xobject_text_inner(
         }
     }
 
-    items
+    Ok(items)
 }
 
 /// Get fonts from a Form XObject's Resources

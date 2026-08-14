@@ -68,6 +68,63 @@ use text_quality::{
 };
 use tounicode::FontCMaps;
 
+/// Decompress a PDF stream while optionally bounding the expanded output.
+///
+/// Callers that recover from malformed compression must use
+/// [`decompressed_stream_content_or_raw`] so a size-limit failure is never
+/// mistaken for an ordinary decode failure.
+pub(crate) fn decompressed_stream_content(
+    stream: &lopdf::Stream,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Vec<u8>> {
+    match max_decompressed_size {
+        Some(limit) => stream.decompressed_content_with_limit(limit),
+        None => stream.decompressed_content(),
+    }
+}
+pub(crate) fn is_decompression_limit_error(error: &lopdf::Error) -> bool {
+    matches!(
+        error,
+        &lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })
+    )
+}
+
+/// Decompress a stream when possible, preserving callers' existing
+/// "unavailable means absent" behavior while propagating a configured limit.
+pub(crate) fn decompressed_stream_content_or_none(
+    stream: &lopdf::Stream,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<Vec<u8>>> {
+    match decompressed_stream_content(stream, max_decompressed_size) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if is_decompression_limit_error(&error) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+
+/// Decompress a stream, retaining the existing raw-byte recovery for malformed
+/// filters while propagating every decompression-limit failure.
+pub(crate) fn decompressed_stream_content_or_raw(
+    stream: &lopdf::Stream,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Vec<u8>> {
+    match decompressed_stream_content(stream, max_decompressed_size) {
+        Ok(content) => Ok(content),
+        Err(error @ lopdf::Error::Decompress(
+            lopdf::DecompressError::MemoryLimitExceeded { .. },
+        )) => Err(error),
+        Err(_) => {
+            if let Some(limit) = max_decompressed_size {
+                if stream.content.len() > limit {
+                    return Err(lopdf::DecompressError::MemoryLimitExceeded { limit }.into());
+                }
+            }
+            Ok(stream.content.clone())
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct ProcessingTimer(std::time::Instant);
 
@@ -185,6 +242,9 @@ pub struct PdfOptions {
     /// Password for decrypting an encrypted PDF. `None` falls back to the
     /// empty password (owner-only encryption).
     pub password: Option<String>,
+    /// Maximum number of bytes any one PDF stream may decompress to while loading.
+    /// `None` keeps lopdf's default unbounded behavior.
+    pub max_decompressed_size: Option<usize>,
 }
 
 // Manual `Debug` so the password is never leaked through debug logging or a
@@ -197,6 +257,7 @@ impl std::fmt::Debug for PdfOptions {
             .field("markdown", &self.markdown)
             .field("page_filter", &self.page_filter)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("max_decompressed_size", &self.max_decompressed_size)
             .finish()
     }
 }
@@ -209,6 +270,7 @@ impl Default for PdfOptions {
             markdown: MarkdownOptions::default(),
             page_filter: None,
             password: None,
+            max_decompressed_size: None,
         }
     }
 }
@@ -256,6 +318,12 @@ impl PdfOptions {
         self.password = Some(password.into());
         self
     }
+
+    /// Bound the decompressed size of each PDF stream while loading.
+    pub fn max_decompressed_size(mut self, max_decompressed_size: usize) -> Self {
+        self.max_decompressed_size = Some(max_decompressed_size);
+        self
+    }
 }
 
 // =========================================================================
@@ -288,8 +356,11 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
 
     // Load the document once — shared by detection AND extraction.
-    let (doc, page_count) =
-        load_document_from_path_with_password(&path, options.password.as_deref())?;
+    let (doc, page_count) = load_document_from_path_with_password_and_limit(
+        &path,
+        options.password.as_deref(),
+        options.max_decompressed_size,
+    )?;
 
     process_document(doc, page_count, options, start)
 }
@@ -314,8 +385,11 @@ pub fn process_pdf_mem_with_options(
     let start = ProcessingTimer::start();
     validate_pdf_bytes(buffer)?;
 
-    let (doc, page_count) =
-        load_document_from_mem_with_password(buffer, options.password.as_deref())?;
+    let (doc, page_count) = load_document_from_mem_with_password_and_limit(
+        buffer,
+        options.password.as_deref(),
+        options.max_decompressed_size,
+    )?;
 
     process_document(doc, page_count, options, start)
 }
@@ -3626,8 +3700,16 @@ pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
     path: P,
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
+    load_document_from_path_with_password_and_limit(path, password, None)
+}
+
+fn load_document_from_path_with_password_and_limit<P: AsRef<Path>>(
+    path: P,
+    password: Option<&str>,
+    max_decompressed_size: Option<usize>,
+) -> Result<(Document, u32), PdfError> {
     let buffer = std::fs::read(&path)?;
-    load_document_from_mem_with_password(&buffer, password)
+    load_document_from_mem_with_password_and_limit(&buffer, password, max_decompressed_size)
 }
 
 /// Load a PDF from a memory buffer.
@@ -3640,25 +3722,33 @@ pub(crate) fn load_document_from_mem_with_password(
     buffer: &[u8],
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
+    load_document_from_mem_with_password_and_limit(buffer, password, None)
+}
+
+fn load_document_from_mem_with_password_and_limit(
+    buffer: &[u8],
+    password: Option<&str>,
+    max_decompressed_size: Option<usize>,
+) -> Result<(Document, u32), PdfError> {
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match load_document_bytes(buf, password) {
+    let doc = match load_document_bytes(buf, password, max_decompressed_size) {
         Ok(doc) => doc,
         Err(first_err) => {
             for repaired in repair_pdf_container_candidates(buf) {
-                match load_document_bytes(&repaired, password) {
+                match load_document_bytes(&repaired, password, max_decompressed_size) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
                         let page_count = doc.get_pages().len() as u32;
                         return Ok((doc, page_count));
                     }
-                    Err(e) => {
-                        if is_encrypted_lopdf_error(&e) {
-                            return Err(e.into());
+                    Err(error) => {
+                        if is_encrypted_lopdf_error(&error) {
+                            return Err(error.into());
                         }
                     }
                 }
@@ -3670,30 +3760,55 @@ pub(crate) fn load_document_from_mem_with_password(
     Ok((doc, page_count))
 }
 
-fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
-    match Document::load_mem(buf) {
+fn load_document_bytes(
+    buf: &[u8],
+    password: Option<&str>,
+    max_decompressed_size: Option<usize>,
+) -> Result<Document, lopdf::Error> {
+    match Document::load_mem_with_options(
+        buf,
+        lopdf::LoadOptions {
+            max_decompressed_size,
+            ..Default::default()
+        },
+    ) {
         // Some encrypted PDFs load structurally but leave their streams
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
         // an encryption error. Handle both by re-loading with the password.
-        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(buf, password),
+        Ok(doc) if doc.is_encrypted() => {
+            decrypt_document_bytes(buf, password, max_decompressed_size)
+        }
         Ok(doc) => Ok(doc),
-        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(buf, password),
-        Err(e) => Err(e),
+        Err(error) if is_encrypted_lopdf_error(&error) => {
+            decrypt_document_bytes(buf, password, max_decompressed_size)
+        }
+        Err(error) => Err(error),
     }
 }
 
 /// Re-load an encrypted PDF, decrypting with `password`. Falls back to the
 /// empty password (owner-only encryption, the common "protected" case) when a
 /// non-empty password was supplied but rejected.
-fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
-    let pw = password.unwrap_or("");
-    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+fn decrypt_document_bytes(
+    buf: &[u8],
+    password: Option<&str>,
+    max_decompressed_size: Option<usize>,
+) -> Result<Document, lopdf::Error> {
+    let load_with_password = |password: &str| {
+        Document::load_mem_with_options(
+            buf,
+            lopdf::LoadOptions {
+                password: Some(password.to_owned()),
+                max_decompressed_size,
+                ..Default::default()
+            },
+        )
+    };
+    let password = password.unwrap_or("");
+    match load_with_password(password) {
         Ok(doc) => Ok(doc),
-        Err(inner) if !pw.is_empty() => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
-                .map_err(|_| inner)
-        }
+        Err(inner) if !password.is_empty() => load_with_password("").map_err(|_| inner),
         Err(inner) => Err(inner),
     }
 }
@@ -3886,7 +4001,12 @@ fn process_document(
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
     // Step 1 — Detection (cheap: scans content streams for text operators)
-    let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
+    let detection = detector::detect_from_document_with_limit(
+        &doc,
+        page_count,
+        &options.detection,
+        options.max_decompressed_size,
+    )?;
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
@@ -3927,59 +4047,67 @@ fn process_document(
 
     // Step 2 — Extraction (reuses the already-loaded document)
     let extracted = {
-        let font_cmaps = FontCMaps::from_doc(&doc);
+        let font_cmaps = FontCMaps::from_doc_with_limit(&doc, options.max_decompressed_size)?;
         // Most page-filtered requests extract only the selected pages. Gather
         // other pages only when a selected contextual folio needs cross-page
         // evidence; failures on those context-only pages are non-fatal.
-        let result = extractor::extract_positioned_text_with_folio_context(
+        let result = extractor::extract_positioned_text_with_folio_context_with_limit(
             &doc,
             &font_cmaps,
             options.page_filter.as_ref(),
+            options.max_decompressed_size,
         );
 
-        // For Mixed/template PDFs: if normal extraction produces garbage text
-        // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
-        // This unlocks OCR text layers behind scanned images.
+        // Mixed/template PDFs may store an OCR text layer as invisible text.
+        // Retry it after empty or garbage visible text, and after ordinary
+        // extraction failures. A decompression-limit breach is the sole
+        // recovery error that must stop processing.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
-                let sample: String = items
-                    .iter()
-                    .filter(|item| {
-                        options
-                            .page_filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.contains(&item.page))
-                    })
-                    .take(200)
-                    .map(|item| item.text.as_str())
-                    .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
-                    extractor::extract_positioned_text_include_invisible_with_folio_context(
+            match result {
+                Ok((items, thresholds, gid_encoded_pages)) => {
+                    let sample: String = items
+                        .iter()
+                        .filter(|item| {
+                            options
+                                .page_filter
+                                .as_ref()
+                                .is_none_or(|filter| filter.contains(&item.page))
+                        })
+                        .take(200)
+                        .map(|item| item.text.as_str())
+                        .collect();
+                    if is_garbage_text(&sample) || sample.trim().is_empty() {
+                        extractor::extract_positioned_text_include_invisible_with_folio_context_with_limit(
+                            &doc,
+                            &font_cmaps,
+                            options.page_filter.as_ref(),
+                            options.max_decompressed_size,
+                        )
+                    } else {
+                        Ok((items, thresholds, gid_encoded_pages))
+                    }
+                }
+                Err(error) if !error.is_decompression_limit() => {
+                    extractor::extract_positioned_text_include_invisible_with_folio_context_with_limit(
                         &doc,
                         &font_cmaps,
                         options.page_filter.as_ref(),
+                        options.max_decompressed_size,
                     )
-                } else {
-                    result
                 }
-            } else {
-                // Normal extraction failed — try invisible as fallback
-                extractor::extract_positioned_text_include_invisible_with_folio_context(
-                    &doc,
-                    &font_cmaps,
-                    options.page_filter.as_ref(),
-                )
+                Err(error) => Err(error),
             }
         } else {
             result
         }
     };
 
-    // For Mixed PDFs, extraction failure is non-fatal
-    let extracted = if pdf_type == PdfType::Mixed {
-        extracted.ok()
-    } else {
-        Some(extracted?)
+    // Mixed documents retain their best-effort text extraction behavior; only
+    // an actual decompression-limit breach becomes a request failure.
+    let extracted = match extracted {
+        Ok(extracted) => Some(extracted),
+        Err(error) if pdf_type == PdfType::Mixed && !error.is_decompression_limit() => None,
+        Err(error) => return Err(error),
     };
 
     // Parse structure tree for tagged PDFs (reuses the loaded document)
@@ -6079,12 +6207,20 @@ pub enum PdfError {
     Io(#[from] std::io::Error),
     #[error("PDF parsing error: {0}")]
     Parse(String),
+    #[error("PDF decompressed stream exceeds {limit}-byte limit")]
+    DecompressionLimit { limit: usize },
     #[error("PDF is encrypted")]
     Encrypted,
     #[error("Invalid PDF structure")]
     InvalidStructure,
     #[error("Not a PDF: {0}")]
     NotAPdf(String),
+}
+
+impl PdfError {
+    pub(crate) fn is_decompression_limit(&self) -> bool {
+        matches!(self, Self::DecompressionLimit { .. })
+    }
 }
 
 impl From<lopdf::Error> for PdfError {
@@ -6096,7 +6232,7 @@ impl From<lopdf::Error> for PdfError {
             | lopdf::Error::AlreadyEncrypted
             | lopdf::Error::UnsupportedSecurityHandler(_) => PdfError::Encrypted,
             lopdf::Error::Unimplemented(msg) if msg.contains("encrypted") => PdfError::Encrypted,
-            lopdf::Error::Parse(ref pe) if pe.to_string().contains("invalid file header") => {
+            lopdf::Error::Parse(pe) if pe.to_string().contains("invalid file header") => {
                 PdfError::NotAPdf("invalid PDF file header".to_string())
             }
             lopdf::Error::MissingXrefEntry
@@ -6105,6 +6241,9 @@ impl From<lopdf::Error> for PdfError {
             | lopdf::Error::ObjectIdMismatch
             | lopdf::Error::InvalidObjectStream(_)
             | lopdf::Error::InvalidOffset(_) => PdfError::InvalidStructure,
+            lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { limit }) => {
+                PdfError::DecompressionLimit { limit }
+            }
             other => PdfError::Parse(other.to_string()),
         }
     }

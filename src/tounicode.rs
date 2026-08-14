@@ -6,12 +6,10 @@ use log::{debug, warn};
 use lopdf::{Document, Object, ObjectId};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::{Path, PathBuf};
 
 use crate::glyph_names::glyph_to_char;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(feature = "builtin_cmaps")]
 static BUILTIN_CMAPS: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/external/bcmaps");
 
@@ -35,11 +33,40 @@ pub(crate) fn build_cmap_entry_from_stream(
     doc: &Document,
     obj_num: u32,
 ) -> Option<CMapEntry> {
+    build_cmap_entry_from_stream_with_limit(data, font_dict, doc, obj_num, None)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn build_cmap_entry_from_stream_with_limit(
+    data: &[u8],
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    obj_num: u32,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<CMapEntry>> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
-        let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
-        let mut fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
-            .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
-            .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
+        let (mut primary, mut remapped) = try_remap_subset_cmap_with_limit(
+            cmap,
+            font_dict,
+            doc,
+            obj_num,
+            max_decompressed_size,
+        )?;
+        let mut fallback =
+            if let Some(cmap) = build_fallback_tounicode_from_encoding_with_limit(
+                font_dict,
+                doc,
+                max_decompressed_size,
+            )? {
+                Some(cmap)
+            } else if let Some(cmap) =
+                build_fallback_cmap_for_type0_with_limit(font_dict, doc, max_decompressed_size)?
+            {
+                Some(cmap)
+            } else {
+                build_fallback_cmap_for_simple_with_limit(font_dict, doc, max_decompressed_size)?
+            };
 
         let primary_entries = primary.char_map.len() + primary.ranges.len();
         if primary_entries < 10 {
@@ -59,7 +86,7 @@ pub(crate) fn build_cmap_entry_from_stream(
         // sequential remap scrambles characters.  The TrueType cmap table maps
         // the real GID→Unicode and is authoritative.
         if remapped.is_some() {
-            if let Some(ref fb) = fallback {
+            if let Some(fb) = &fallback {
                 let fb_entries = fb.char_map.len() + fb.ranges.len();
                 if fb_entries > primary_entries {
                     debug!(
@@ -73,25 +100,34 @@ pub(crate) fn build_cmap_entry_from_stream(
             }
         }
 
-        return Some(CMapEntry {
+        return Ok(Some(CMapEntry {
             primary,
             remapped,
             fallback,
-        });
+        }));
     }
 
-    let fallback = build_fallback_cmap_for_type0(font_dict, doc)
-        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))?;
+    let fallback = if let Some(cmap) =
+        build_fallback_cmap_for_type0_with_limit(font_dict, doc, max_decompressed_size)?
+    {
+        cmap
+    } else if let Some(cmap) =
+        build_fallback_cmap_for_simple_with_limit(font_dict, doc, max_decompressed_size)?
+    {
+        cmap
+    } else {
+        return Ok(None);
+    };
     debug!(
         "ToUnicode CMap obj={} parse failed; using fallback (entries={})",
         obj_num,
         fallback.char_map.len()
     );
-    Some(CMapEntry {
+    Ok(Some(CMapEntry {
         primary: fallback,
         remapped: None,
         fallback: None,
-    })
+    }))
 }
 
 impl ToUnicodeCMap {
@@ -829,16 +865,32 @@ fn w_array_covers_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document, target:
 
 /// Extract CIDToGIDMap as a vector of GIDs (u16) indexed by CID.
 fn get_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u16>> {
-    let obj = cid_font_dict.get(b"CIDToGIDMap").ok()?;
-    match obj {
-        Object::Name(n) if n.as_slice() == b"Identity" => None,
-        Object::Reference(r) => match doc.get_object(*r) {
-            Ok(Object::Stream(s)) => parse_cid_to_gid_stream(&s.decompressed_content().ok()?),
+    get_cid_to_gid_map_with_limit(cid_font_dict, doc, None)
+        .expect("unbounded CIDToGIDMap reads never return a size error")
+}
+
+fn get_cid_to_gid_map_with_limit(
+    cid_font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<Vec<u16>>> {
+    let Some(obj) = cid_font_dict.get(b"CIDToGIDMap").ok() else {
+        return Ok(None);
+    };
+    let data = match obj {
+        Object::Name(name) if name.as_slice() == b"Identity" => return Ok(None),
+        Object::Reference(reference) => match doc.get_object(*reference) {
+            Ok(Object::Stream(stream)) => {
+                crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+            }
             _ => None,
         },
-        Object::Stream(s) => parse_cid_to_gid_stream(&s.decompressed_content().ok()?),
+        Object::Stream(stream) => {
+            crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+        }
         _ => None,
-    }
+    };
+    Ok(data.and_then(|data| parse_cid_to_gid_stream(&data)))
 }
 
 fn parse_cid_to_gid_stream(data: &[u8]) -> Option<Vec<u16>> {
@@ -882,25 +934,36 @@ fn try_remap_subset_cmap(
     doc: &Document,
     obj_num: u32,
 ) -> (ToUnicodeCMap, Option<ToUnicodeCMap>) {
+    try_remap_subset_cmap_with_limit(cmap, font_dict, doc, obj_num, None)
+        .expect("unbounded CMap remapping never returns a size error")
+}
+
+fn try_remap_subset_cmap_with_limit(
+    cmap: ToUnicodeCMap,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    obj_num: u32,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<(ToUnicodeCMap, Option<ToUnicodeCMap>)> {
     // Only applies to Identity-H/V CID fonts
     let encoding = font_dict
         .get(b"Encoding")
         .ok()
-        .and_then(|o| o.as_name().ok());
+        .and_then(|object| object.as_name().ok());
     if encoding != Some(b"Identity-H") && encoding != Some(b"Identity-V") {
-        return (cmap, None);
+        return Ok((cmap, None));
     }
 
     // CMap's minimum source CID must be > 2 (indicating old, non-sequential GIDs)
     let min_cid = match cmap.min_source_cid() {
-        Some(c) if c > 2 => c,
-        _ => return (cmap, None),
+        Some(cid) if cid > 2 => cid,
+        _ => return Ok((cmap, None)),
     };
 
     // Navigate to DescendantFonts[0]
     let cid_font_dict = match get_descendant_cid_font(font_dict, doc) {
-        Some(d) => d,
-        None => return (cmap, None),
+        Some(dictionary) => dictionary,
+        None => return Ok((cmap, None)),
     };
 
     // Both repair paths below assume CIDs are glyph indices that a subsetter can
@@ -913,32 +976,37 @@ fn try_remap_subset_cmap(
     // Only bail out when the descendant is *explicitly* something other than
     // CIDFontType2: a missing or unresolvable /Subtype keeps the previous
     // behaviour rather than silently disabling the repair.
-    let subtype = cid_font_dict.get(b"Subtype").ok().and_then(|o| match o {
-        Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_name().ok()),
-        other => other.as_name().ok(),
+    let subtype = cid_font_dict.get(b"Subtype").ok().and_then(|object| match object {
+        Object::Reference(reference) => doc
+            .get_object(*reference)
+            .ok()
+            .and_then(|object| object.as_name().ok()),
+        object => object.as_name().ok(),
     });
     if subtype.is_some_and(|name| name != b"CIDFontType2") {
         debug!("Subset remap skipped for obj={obj_num}: descendant is not CIDFontType2");
-        return (cmap, None);
+        return Ok((cmap, None));
     }
 
     // If there's an explicit CIDToGIDMap, build a repaired CMap using it.
-    if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
+    if let Some(cid_to_gid) =
+        get_cid_to_gid_map_with_limit(cid_font_dict, doc, max_decompressed_size)?
+    {
         if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
             debug!(
                 "CIDToGIDMap repair applied for obj={}: {} entries",
                 obj_num,
                 repaired.char_map.len()
             );
-            return (cmap, Some(repaired));
+            return Ok((cmap, Some(repaired)));
         }
         // Fall through to sequential remap if repair failed.
     }
 
     // W array must start at a low CID (≤ 2), indicating sequential post-subset GIDs
     let w_start = match get_w_array_start_cid(cid_font_dict, doc) {
-        Some(c) if c <= 2 => c,
-        _ => return (cmap, None),
+        Some(cid) if cid <= 2 => cid,
+        _ => return Ok((cmap, None)),
     };
 
     // If the W array actually covers the CMap's max source CID, the CMap is
@@ -951,7 +1019,7 @@ fn try_remap_subset_cmap(
                 "Subset remap skipped for obj={}: W array covers CMap max CID {}",
                 obj_num, max_cid
             );
-            return (cmap, None);
+            return Ok((cmap, None));
         }
     }
 
@@ -961,7 +1029,7 @@ fn try_remap_subset_cmap(
     );
 
     let remapped = cmap.remap_to_sequential();
-    (cmap, Some(remapped))
+    Ok((cmap, Some(remapped)))
 }
 
 /// Build a ToUnicodeCMap from an embedded TrueType font's cmap table.
@@ -1212,39 +1280,32 @@ fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     Some(cmap)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn find_bcmaps_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("PDF_INSPECTOR_BCMAPS_DIR") {
-        let p = PathBuf::from(dir);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    let default = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("external")
-        .join("bcmaps");
-    if default.is_dir() {
-        return Some(default);
-    }
-    None
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
-    let path = find_bcmaps_dir()?.join(name);
-    std::fs::read(path).ok().map(Cow::Owned)
-}
-
-#[cfg(target_arch = "wasm32")]
+#[cfg(feature = "builtin_cmaps")]
 fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
     let file = BUILTIN_CMAPS.get_file(name)?;
     Some(Cow::Borrowed(file.contents()))
 }
 
+#[cfg(not(feature = "builtin_cmaps"))]
+fn read_builtin_cmap_file(_name: &str) -> Option<Cow<'static, [u8]>> {
+    None
+}
+
+#[cfg(all(test, feature = "builtin_cmaps"))]
+mod builtin_cmap_tests {
+    use super::read_builtin_cmap_file;
+
+    #[test]
+    fn embeds_adobe_gb1_cmap() {
+        assert!(read_builtin_cmap_file("Adobe-GB1-UCS2.bcmap").is_some());
+    }
+}
+
 fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
+    const UCS2_DATA_SIZE: usize = 1;
+
     let mut stream = BinaryCMapStream::new(data);
     let _header = stream.read_byte().ok_or("unexpected EOF in bcmap header")?;
-
     let mut cmap = ToUnicodeCMap::new();
     let mut use_cmap: Option<String> = None;
 
@@ -1255,77 +1316,164 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
                 0 => {
                     stream.read_string()?;
                 }
-                1 => {
-                    let name = stream.read_string()?;
-                    use_cmap = Some(name);
-                }
+                1 => use_cmap = Some(stream.read_string()?),
                 _ => {}
             }
             continue;
         }
+
         let sequence = (b & 0x10) != 0;
         let data_size = (b & 0x0f) as usize;
-        if data_size + 1 > 16 {
+        if data_size + 1 > MAX_BINARY_CMAP_BYTES {
             return Err("invalid dataSize in bcmap".to_string());
         }
+        let len = data_size + 1;
         let subitems = stream.read_number()? as usize;
+
         match typ {
+            0 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(data_size)?;
+                add_hex(&mut end[..len], &delta[..len]);
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..len]);
+                    start[..len].copy_from_slice(&end[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut start[..len], &delta[..len]);
+                    end[..len].copy_from_slice(&start[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end[..len], &delta[..len]);
+                }
+            }
+            1 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(data_size)?;
+                add_hex(&mut end[..len], &delta[..len]);
+                let _ = stream.read_number()?;
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..len]);
+                    start[..len].copy_from_slice(&end[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut start[..len], &delta[..len]);
+                    end[..len].copy_from_slice(&start[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end[..len], &delta[..len]);
+                    let _ = stream.read_number()?;
+                }
+            }
+            2 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut source = stream.read_hex(data_size)?;
+                let _ = stream.read_number()?;
+                for _ in 1..subitems {
+                    increment_hex(&mut source[..len]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(data_size)?;
+                        add_hex(&mut source[..len], &delta[..len]);
+                    }
+                    let _ = stream.read_signed()?;
+                }
+            }
+            3 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(data_size)?;
+                add_hex(&mut end[..len], &delta[..len]);
+                let _ = stream.read_number()?;
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..len]);
+                    start[..len].copy_from_slice(&end[..len]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(data_size)?;
+                        add_hex(&mut start[..len], &delta[..len]);
+                    }
+                    end[..len].copy_from_slice(&start[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end[..len], &delta[..len]);
+                    let _ = stream.read_number()?;
+                }
+            }
             4 => {
-                // bfchar
-                for i in 0..subitems {
-                    let src = stream.read_hex_number(1)?;
-                    let dst = stream.read_hex_bytes(data_size + 1)?;
-                    let src_code = hex_to_u32(&src) as u16;
-                    if let Some(s) = bytes_to_unicode_string(&dst) {
-                        cmap.char_map.insert(src_code, s);
+                if subitems == 0 {
+                    continue;
+                }
+                let mut source = stream.read_hex(UCS2_DATA_SIZE)?;
+                let mut destination = stream.read_hex(data_size)?;
+                insert_binary_unicode_char(
+                    &mut cmap,
+                    &source[..UCS2_DATA_SIZE + 1],
+                    &destination[..len],
+                );
+                for _ in 1..subitems {
+                    increment_hex(&mut source[..UCS2_DATA_SIZE + 1]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                        add_hex(
+                            &mut source[..UCS2_DATA_SIZE + 1],
+                            &delta[..UCS2_DATA_SIZE + 1],
+                        );
                     }
-                    if i + 1 < subitems && sequence {
-                        // sequence handled by encoded data, nothing to do
-                    }
+                    increment_hex(&mut destination[..len]);
+                    let delta = stream.read_hex_signed(data_size)?;
+                    add_hex(&mut destination[..len], &delta[..len]);
+                    insert_binary_unicode_char(
+                        &mut cmap,
+                        &source[..UCS2_DATA_SIZE + 1],
+                        &destination[..len],
+                    );
                 }
             }
             5 => {
-                // bfrange
-                for _ in 0..subitems {
-                    let start = stream.read_hex_number(1)?;
-                    let end_delta = stream.read_hex_number(1)?;
-                    let mut end = start.clone();
-                    add_hex(&mut end, &end_delta);
-                    let dst = stream.read_hex_bytes(data_size + 1)?;
-                    let start_code = hex_to_u32(&start) as u16;
-                    let end_code = hex_to_u32(&end) as u16;
-                    if let Some(s) = bytes_to_unicode_string(&dst) {
-                        if s.chars().count() == 1 {
-                            let base = s.chars().next().unwrap() as u32;
-                            cmap.ranges.push((start_code, end_code, base));
-                        } else {
-                            // Expand multi-char sequences
-                            let mut cid = start_code;
-                            for ch in s.chars() {
-                                cmap.char_map.insert(cid, ch.to_string());
-                                if cid == end_code {
-                                    break;
-                                }
-                                cid = cid.saturating_add(1);
-                            }
-                        }
+                if subitems == 0 {
+                    continue;
+                }
+                let mut start = stream.read_hex(UCS2_DATA_SIZE)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                add_hex(&mut end[..UCS2_DATA_SIZE + 1], &delta[..UCS2_DATA_SIZE + 1]);
+                let destination = stream.read_hex(data_size)?;
+                insert_binary_unicode_range(
+                    &mut cmap,
+                    &start[..UCS2_DATA_SIZE + 1],
+                    &end[..UCS2_DATA_SIZE + 1],
+                    &destination[..len],
+                );
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..UCS2_DATA_SIZE + 1]);
+                    start[..UCS2_DATA_SIZE + 1].copy_from_slice(&end[..UCS2_DATA_SIZE + 1]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                        add_hex(
+                            &mut start[..UCS2_DATA_SIZE + 1],
+                            &delta[..UCS2_DATA_SIZE + 1],
+                        );
                     }
+                    end[..UCS2_DATA_SIZE + 1].copy_from_slice(&start[..UCS2_DATA_SIZE + 1]);
+                    let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                    add_hex(&mut end[..UCS2_DATA_SIZE + 1], &delta[..UCS2_DATA_SIZE + 1]);
+                    let destination = stream.read_hex(data_size)?;
+                    insert_binary_unicode_range(
+                        &mut cmap,
+                        &start[..UCS2_DATA_SIZE + 1],
+                        &end[..UCS2_DATA_SIZE + 1],
+                        &destination[..len],
+                    );
                 }
             }
-            _ => {
-                // Skip unsupported types by consuming their payload.
-                // We only implement bfchar/bfrange for UCS2 maps.
-                for _ in 0..subitems {
-                    // Best-effort skip: read a few fields based on type.
-                    if typ <= 3 {
-                        let _ = stream.read_hex_number(data_size)?;
-                        let _ = stream.read_hex_number(data_size)?;
-                        if typ >= 1 {
-                            let _ = stream.read_number()?;
-                        }
-                    }
-                }
-            }
+            _ => return Err(format!("unknown bcmap record type {typ}")),
         }
     }
 
@@ -1339,6 +1487,9 @@ fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
     }
     Ok(cmap)
 }
+
+const MAX_BINARY_CMAP_BYTES: usize = 16;
+const MAX_BINARY_CMAP_ENCODED_BYTES: usize = 19;
 
 struct BinaryCMapStream<'a> {
     data: &'a [u8],
@@ -1373,40 +1524,68 @@ impl<'a> BinaryCMapStream<'a> {
         Ok(n)
     }
 
-    fn read_hex_number(&mut self, size: usize) -> Result<Vec<u8>, String> {
-        // encoded 7-bit number into size+1 bytes
-        let mut stack = Vec::new();
-        loop {
-            let b = self.read_byte().ok_or("unexpected EOF in bcmap")?;
-            let last = (b & 0x80) == 0;
-            stack.push(b & 0x7f);
-            if last {
-                break;
-            }
+    fn read_signed(&mut self) -> Result<i64, String> {
+        let number = self.read_number()?;
+        if number & 1 == 0 {
+            Ok((number >> 1) as i64)
+        } else {
+            Ok(-((number >> 1) as i64) - 1)
         }
-        let mut out = vec![0u8; size + 1];
-        let mut buffer = 0u32;
-        let mut buffer_size = 0u32;
-        let mut i: i32 = size as i32;
-        while i >= 0 {
-            while buffer_size < 8 && !stack.is_empty() {
-                buffer |= (stack.pop().unwrap() as u32) << buffer_size;
-                buffer_size += 7;
-            }
-            out[i as usize] = (buffer & 0xff) as u8;
-            buffer >>= 8;
-            buffer_size = buffer_size.saturating_sub(8);
-            i -= 1;
+    }
+
+    fn read_hex(&mut self, size: usize) -> Result<[u8; MAX_BINARY_CMAP_BYTES], String> {
+        if size + 1 > MAX_BINARY_CMAP_BYTES {
+            return Err("invalid dataSize in bcmap".to_string());
+        }
+        let mut out = [0; MAX_BINARY_CMAP_BYTES];
+        for byte in &mut out[..size + 1] {
+            *byte = self.read_byte().ok_or("unexpected EOF in bcmap")?;
         }
         Ok(out)
     }
 
-    fn read_hex_bytes(&mut self, len: usize) -> Result<Vec<u8>, String> {
-        if self.pos + len > self.data.len() {
-            return Err("unexpected EOF in bcmap".to_string());
+    fn read_hex_number(&mut self, size: usize) -> Result<[u8; MAX_BINARY_CMAP_BYTES], String> {
+        if size + 1 > MAX_BINARY_CMAP_BYTES {
+            return Err("invalid dataSize in bcmap".to_string());
         }
-        let out = self.data[self.pos..self.pos + len].to_vec();
-        self.pos += len;
+        let mut encoded = [0; MAX_BINARY_CMAP_ENCODED_BYTES];
+        let mut encoded_len = 0;
+        loop {
+            if encoded_len == encoded.len() {
+                return Err("encoded number exceeds bcmap limit".to_string());
+            }
+            let byte = self.read_byte().ok_or("unexpected EOF in bcmap")?;
+            encoded[encoded_len] = byte & 0x7f;
+            encoded_len += 1;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+
+        let mut out = [0; MAX_BINARY_CMAP_BYTES];
+        let mut buffer = 0u32;
+        let mut buffer_size = 0u32;
+        for output_index in (0..=size).rev() {
+            while buffer_size < 8 && encoded_len > 0 {
+                encoded_len -= 1;
+                buffer |= u32::from(encoded[encoded_len]) << buffer_size;
+                buffer_size += 7;
+            }
+            out[output_index] = (buffer & 0xff) as u8;
+            buffer >>= 8;
+            buffer_size = buffer_size.saturating_sub(8);
+        }
+        Ok(out)
+    }
+
+    fn read_hex_signed(&mut self, size: usize) -> Result<[u8; MAX_BINARY_CMAP_BYTES], String> {
+        let mut out = self.read_hex_number(size)?;
+        let sign = if out[size] & 1 == 0 { 0 } else { 0xff };
+        let mut carry = 0u16;
+        for byte in &mut out[..=size] {
+            carry = ((carry & 1) << 8) | u16::from(*byte);
+            *byte = ((carry >> 1) as u8) ^ sign;
+        }
         Ok(out)
     }
 
@@ -1414,8 +1593,9 @@ impl<'a> BinaryCMapStream<'a> {
         let len = self.read_number()? as usize;
         let mut buf = Vec::with_capacity(len);
         for _ in 0..len {
-            let v = self.read_number()? as u8;
-            buf.push(v);
+            let value = self.read_number()?;
+            let byte = u8::try_from(value).map_err(|_| "invalid bcmap string byte")?;
+            buf.push(byte);
         }
         String::from_utf8(buf).map_err(|e| e.to_string())
     }
@@ -1435,6 +1615,18 @@ fn add_hex(a: &mut [u8], b: &[u8]) {
         c += a[i] as u16 + b[i] as u16;
         a[i] = (c & 0xff) as u8;
         c >>= 8;
+    }
+}
+
+fn increment_hex(bytes: &mut [u8]) {
+    let mut carry = 1u16;
+    for byte in bytes.iter_mut().rev() {
+        let value = u16::from(*byte) + carry;
+        *byte = value as u8;
+        carry = value >> 8;
+        if carry == 0 {
+            break;
+        }
     }
 }
 
@@ -1460,6 +1652,43 @@ fn bytes_to_unicode_string(bytes: &[u8]) -> Option<String> {
     }
 }
 
+fn insert_binary_unicode_char(cmap: &mut ToUnicodeCMap, source: &[u8], destination: &[u8]) {
+    let Ok(code) = u16::try_from(hex_to_u32(source)) else {
+        return;
+    };
+    if let Some(text) = bytes_to_unicode_string(destination) {
+        cmap.char_map.insert(code, text);
+    }
+}
+
+fn insert_binary_unicode_range(
+    cmap: &mut ToUnicodeCMap,
+    start: &[u8],
+    end: &[u8],
+    destination: &[u8],
+) {
+    let (Ok(start_code), Ok(end_code)) = (
+        u16::try_from(hex_to_u32(start)),
+        u16::try_from(hex_to_u32(end)),
+    ) else {
+        return;
+    };
+    if start_code > end_code {
+        return;
+    }
+    let Some(text) = bytes_to_unicode_string(destination) else {
+        return;
+    };
+    if text.chars().count() == 1 {
+        cmap.ranges
+            .push((start_code, end_code, text.chars().next().unwrap() as u32));
+    } else {
+        for (code, character) in (start_code..=end_code).zip(text.chars()) {
+            cmap.char_map.insert(code, character.to_string());
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EncodingCMap {
     map: HashMap<u16, u16>,
@@ -1471,26 +1700,97 @@ fn build_fallback_tounicode_from_encoding(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<ToUnicodeCMap> {
-    let encoding = build_encoding_cmap_from_font(font_dict, doc)?;
-    let ordering = get_cid_system_info_ordering(font_dict, doc)?;
-    let ucs2 = build_cmap_from_builtin_cmap(&ordering)?;
+    build_fallback_tounicode_from_encoding_with_limit(font_dict, doc, None)
+        .expect("unbounded encoding CMap reads never return a size error")
+}
+
+fn build_fallback_tounicode_from_encoding_with_limit(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<ToUnicodeCMap>> {
+    let Some(encoding) =
+        build_encoding_cmap_from_font_with_limit(font_dict, doc, max_decompressed_size)?
+    else {
+        return Ok(None);
+    };
+    let Some(ordering) = get_cid_system_info_ordering(font_dict, doc) else {
+        return Ok(None);
+    };
+    let Some(ucs2) = build_cmap_from_builtin_cmap(&ordering) else {
+        return Ok(None);
+    };
 
     if encoding.is_identity {
         // Identity mapping: charcode == CID
-        return Some(ucs2);
+        return Ok(Some(ucs2));
     }
 
     let mut cmap = ToUnicodeCMap::new();
     for (charcode, cid) in encoding.map {
-        if let Some(s) = ucs2.lookup(cid) {
-            cmap.char_map.insert(charcode, s);
+        if let Some(text) = ucs2.lookup(cid) {
+            cmap.char_map.insert(charcode, text);
         }
     }
     if cmap.char_map.is_empty() {
-        return None;
+        return Ok(None);
     }
     cmap.code_byte_length = encoding.code_byte_length;
-    Some(cmap)
+    Ok(Some(cmap))
+}
+
+pub(crate) fn build_cmap_entry_from_encoding_fallback(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) -> Option<CMapEntry> {
+    build_cmap_entry_from_encoding_fallback_with_limit(font_dict, doc, None)
+        .expect("unbounded encoding CMap reads never return a size error")
+}
+
+pub(crate) fn build_cmap_entry_from_encoding_fallback_with_limit(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<CMapEntry>> {
+    let is_type0 = font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+        == Some(b"Type0");
+    if !is_type0 {
+        return Ok(None);
+    }
+
+    let Some(encoding) =
+        build_encoding_cmap_from_font_with_limit(font_dict, doc, max_decompressed_size)?
+    else {
+        return Ok(None);
+    };
+    if encoding.is_identity {
+        return Ok(None);
+    }
+
+    let Some(ordering) = get_cid_system_info_ordering(font_dict, doc) else {
+        return Ok(None);
+    };
+    let Some(ucs2) = build_cmap_from_builtin_cmap(&ordering) else {
+        return Ok(None);
+    };
+    let mut primary = ToUnicodeCMap::new();
+    for (charcode, cid) in encoding.map {
+        if let Some(text) = ucs2.lookup(cid) {
+            primary.char_map.insert(charcode, text);
+        }
+    }
+    if primary.char_map.is_empty() {
+        return Ok(None);
+    }
+    primary.code_byte_length = encoding.code_byte_length;
+    Ok(Some(CMapEntry {
+        primary,
+        remapped: None,
+        fallback: None,
+    }))
 }
 
 fn get_cid_system_info_ordering(font_dict: &lopdf::Dictionary, doc: &Document) -> Option<String> {
@@ -1515,38 +1815,71 @@ fn build_encoding_cmap_from_font(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<EncodingCMap> {
-    let encoding_obj = font_dict.get(b"Encoding").ok()?;
+    build_encoding_cmap_from_font_with_limit(font_dict, doc, None)
+        .expect("unbounded encoding CMap reads never return a size error")
+}
+
+fn build_encoding_cmap_from_font_with_limit(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<EncodingCMap>> {
+    let Some(encoding_obj) = font_dict.get(b"Encoding").ok() else {
+        return Ok(None);
+    };
     match encoding_obj {
         Object::Name(name) => {
-            let enc = name.as_slice();
-            if enc == b"Identity-H" || enc == b"Identity-V" {
-                return Some(EncodingCMap {
+            let encoding_name = name.as_slice();
+            if encoding_name == b"Identity-H" || encoding_name == b"Identity-V" {
+                return Ok(Some(EncodingCMap {
                     map: HashMap::new(),
                     code_byte_length: 2,
                     is_identity: true,
-                });
+                }));
             }
-            let enc_name = String::from_utf8_lossy(enc).to_string();
-            load_builtin_encoding_cmap(&enc_name)
+            let encoding_name = String::from_utf8_lossy(encoding_name).to_string();
+            Ok(load_builtin_encoding_cmap(&encoding_name))
         }
-        Object::Reference(r) => {
-            let obj = doc.get_object(*r).ok()?;
-            parse_encoding_cmap_object(obj, doc)
-        }
-        Object::Stream(s) => parse_encoding_cmap_stream(&s.decompressed_content().ok()?),
-        Object::Dictionary(_) => None,
-        _ => None,
+        Object::Reference(reference) => match doc.get_object(*reference) {
+            Ok(object) => {
+                parse_encoding_cmap_object_with_limit(object, doc, max_decompressed_size)
+            }
+            Err(_) => Ok(None),
+        },
+        Object::Stream(stream) => Ok(
+            crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+                .and_then(|data| parse_encoding_cmap_stream(&data)),
+        ),
+        Object::Dictionary(_) => Ok(None),
+        _ => Ok(None),
     }
 }
 
-fn parse_encoding_cmap_object(obj: &Object, doc: &Document) -> Option<EncodingCMap> {
-    match obj {
-        Object::Stream(s) => parse_encoding_cmap_stream(&s.decompressed_content().ok()?),
-        Object::Reference(r) => {
-            let obj = doc.get_object(*r).ok()?;
-            parse_encoding_cmap_object(obj, doc)
-        }
-        _ => None,
+fn parse_encoding_cmap_object(
+    object: &Object,
+    doc: &Document,
+) -> Option<EncodingCMap> {
+    parse_encoding_cmap_object_with_limit(object, doc, None)
+        .expect("unbounded encoding CMap reads never return a size error")
+}
+
+fn parse_encoding_cmap_object_with_limit(
+    object: &Object,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<EncodingCMap>> {
+    match object {
+        Object::Stream(stream) => Ok(
+            crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+                .and_then(|data| parse_encoding_cmap_stream(&data)),
+        ),
+        Object::Reference(reference) => match doc.get_object(*reference) {
+            Ok(object) => {
+                parse_encoding_cmap_object_with_limit(object, doc, max_decompressed_size)
+            }
+            Err(_) => Ok(None),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -1769,12 +2102,49 @@ fn assign_encoding_cid(
     true
 }
 
+fn insert_binary_encoding_cid(
+    map: &mut HashMap<u16, u16>,
+    code: u32,
+    cid: i64,
+    assigned: &mut usize,
+) {
+    let (Ok(code), Ok(cid)) = (u16::try_from(code), u16::try_from(cid)) else {
+        return;
+    };
+    let _ = assign_encoding_cid(map, code, cid, assigned);
+}
+
+fn insert_binary_encoding_range(
+    map: &mut HashMap<u16, u16>,
+    start: u32,
+    end: u32,
+    cid: i64,
+    assigned: &mut usize,
+) {
+    if start > end || start > u32::from(u16::MAX) {
+        return;
+    }
+    let end = end.min(u32::from(u16::MAX));
+    for code in start..=end {
+        let Some(cid) = cid.checked_add(i64::from(code - start)) else {
+            return;
+        };
+        insert_binary_encoding_cid(map, code, cid, assigned);
+        if *assigned >= MAX_CID_W_EXPANSION {
+            return;
+        }
+    }
+}
+
 fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
+    const UCS2_DATA_SIZE: usize = 1;
+
     let mut stream = BinaryCMapStream::new(data);
     let _header = stream.read_byte().ok_or("unexpected EOF in bcmap header")?;
-    let mut map: HashMap<u16, u16> = HashMap::new();
-    let mut max_code_size: u8 = 1;
-    let mut use_cmap: Option<String> = None;
+    let mut map = HashMap::new();
+    let mut assigned = 0;
+    let mut max_code_size = 1;
+    let mut use_cmap = None;
 
     while let Some(b) = stream.read_byte() {
         let typ = b >> 5;
@@ -1783,68 +2153,173 @@ fn parse_binary_cmap_encoding(data: &[u8]) -> Result<EncodingCMap, String> {
                 0 => {
                     stream.read_string()?;
                 }
-                1 => {
-                    let name = stream.read_string()?;
-                    use_cmap = Some(name);
-                }
+                1 => use_cmap = Some(stream.read_string()?),
                 _ => {}
             }
             continue;
         }
-        let _sequence = (b & 0x10) != 0;
+
+        let sequence = (b & 0x10) != 0;
         let data_size = (b & 0x0f) as usize;
-        if data_size + 1 > 16 {
+        if data_size + 1 > MAX_BINARY_CMAP_BYTES {
             return Err("invalid dataSize in bcmap".to_string());
         }
-        max_code_size = max_code_size.max((data_size + 1) as u8);
+        let len = data_size + 1;
+        max_code_size = max_code_size.max(len as u8);
         let subitems = stream.read_number()? as usize;
+
         match typ {
-            2 => {
-                // cidchar
-                let mut prev_code: u32 = 0;
-                for i in 0..subitems {
-                    let code_bytes = stream.read_hex_number(data_size)?;
-                    let code = hex_to_u32(&code_bytes);
-                    let cid = stream.read_number()? as u16;
-                    if i == 0 {
-                        prev_code = code;
-                        map.insert(code as u16, cid);
-                        continue;
-                    }
-                    if _sequence {
-                        prev_code = prev_code.saturating_add(1);
-                        map.insert(prev_code as u16, cid);
-                    } else {
-                        map.insert(code as u16, cid);
-                        prev_code = code;
-                    }
+            0 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(data_size)?;
+                add_hex(&mut end[..len], &delta[..len]);
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..len]);
+                    start[..len].copy_from_slice(&end[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut start[..len], &delta[..len]);
+                    end[..len].copy_from_slice(&start[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end[..len], &delta[..len]);
                 }
             }
-            3 => {
-                // cidrange
-                for _ in 0..subitems {
-                    let start = stream.read_hex_number(data_size)?;
-                    let end_delta = stream.read_hex_number(data_size)?;
-                    let mut end = start.clone();
-                    add_hex(&mut end, &end_delta);
-                    let cid_start = stream.read_number()? as u16;
-                    let start_code = hex_to_u32(&start) as u16;
-                    let end_code = hex_to_u32(&end) as u16;
-                    let mut cid = cid_start;
-                    for code in start_code..=end_code {
-                        map.insert(code, cid);
-                        cid = cid.saturating_add(1);
-                    }
+            1 => {
+                if subitems == 0 {
+                    continue;
                 }
-            }
-            _ => {
-                // Skip other types
-                for _ in 0..subitems {
-                    let _ = stream.read_hex_number(data_size)?;
-                    let _ = stream.read_hex_number(data_size)?;
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(data_size)?;
+                add_hex(&mut end[..len], &delta[..len]);
+                let _ = stream.read_number()?;
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..len]);
+                    start[..len].copy_from_slice(&end[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut start[..len], &delta[..len]);
+                    end[..len].copy_from_slice(&start[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end[..len], &delta[..len]);
                     let _ = stream.read_number()?;
                 }
             }
+            2 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut source = stream.read_hex(data_size)?;
+                let mut cid = i64::from(stream.read_number()?);
+                insert_binary_encoding_cid(
+                    &mut map,
+                    hex_to_u32(&source[..len]),
+                    cid,
+                    &mut assigned,
+                );
+                for _ in 1..subitems {
+                    increment_hex(&mut source[..len]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(data_size)?;
+                        add_hex(&mut source[..len], &delta[..len]);
+                    }
+                    let delta = stream.read_signed()?;
+                    cid = cid
+                        .checked_add(1)
+                        .and_then(|value| value.checked_add(delta))
+                        .ok_or("cidchar value overflow in bcmap")?;
+                    insert_binary_encoding_cid(
+                        &mut map,
+                        hex_to_u32(&source[..len]),
+                        cid,
+                        &mut assigned,
+                    );
+                }
+            }
+            3 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut start = stream.read_hex(data_size)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(data_size)?;
+                add_hex(&mut end[..len], &delta[..len]);
+                let cid = i64::from(stream.read_number()?);
+                insert_binary_encoding_range(
+                    &mut map,
+                    hex_to_u32(&start[..len]),
+                    hex_to_u32(&end[..len]),
+                    cid,
+                    &mut assigned,
+                );
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..len]);
+                    start[..len].copy_from_slice(&end[..len]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(data_size)?;
+                        add_hex(&mut start[..len], &delta[..len]);
+                    }
+                    end[..len].copy_from_slice(&start[..len]);
+                    let delta = stream.read_hex_number(data_size)?;
+                    add_hex(&mut end[..len], &delta[..len]);
+                    let cid = i64::from(stream.read_number()?);
+                    insert_binary_encoding_range(
+                        &mut map,
+                        hex_to_u32(&start[..len]),
+                        hex_to_u32(&end[..len]),
+                        cid,
+                        &mut assigned,
+                    );
+                }
+            }
+            4 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut source = stream.read_hex(UCS2_DATA_SIZE)?;
+                let mut destination = stream.read_hex(data_size)?;
+                for _ in 1..subitems {
+                    increment_hex(&mut source[..UCS2_DATA_SIZE + 1]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                        add_hex(
+                            &mut source[..UCS2_DATA_SIZE + 1],
+                            &delta[..UCS2_DATA_SIZE + 1],
+                        );
+                    }
+                    increment_hex(&mut destination[..len]);
+                    let delta = stream.read_hex_signed(data_size)?;
+                    add_hex(&mut destination[..len], &delta[..len]);
+                }
+            }
+            5 => {
+                if subitems == 0 {
+                    continue;
+                }
+                let mut start = stream.read_hex(UCS2_DATA_SIZE)?;
+                let mut end = start;
+                let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                add_hex(&mut end[..UCS2_DATA_SIZE + 1], &delta[..UCS2_DATA_SIZE + 1]);
+                let _ = stream.read_hex(data_size)?;
+                for _ in 1..subitems {
+                    increment_hex(&mut end[..UCS2_DATA_SIZE + 1]);
+                    start[..UCS2_DATA_SIZE + 1].copy_from_slice(&end[..UCS2_DATA_SIZE + 1]);
+                    if !sequence {
+                        let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                        add_hex(
+                            &mut start[..UCS2_DATA_SIZE + 1],
+                            &delta[..UCS2_DATA_SIZE + 1],
+                        );
+                    }
+                    end[..UCS2_DATA_SIZE + 1].copy_from_slice(&start[..UCS2_DATA_SIZE + 1]);
+                    let delta = stream.read_hex_number(UCS2_DATA_SIZE)?;
+                    add_hex(&mut end[..UCS2_DATA_SIZE + 1], &delta[..UCS2_DATA_SIZE + 1]);
+                    let _ = stream.read_hex(data_size)?;
+                }
+            }
+            _ => return Err(format!("unknown bcmap record type {typ}")),
         }
     }
 
@@ -2038,12 +2513,21 @@ impl FontCMaps {
     /// Iterates every page, collects fonts (including Form XObject fonts),
     /// and parses any `/ToUnicode` streams via lopdf's decompression.
     pub fn from_doc(doc: &Document) -> Self {
-        Self::from_doc_pages(doc, None)
+        Self::from_doc_with_limit(doc, None)
+            .expect("unbounded CMap collection never returns a size error")
+    }
+
+    pub(crate) fn from_doc_with_limit(
+        doc: &Document,
+        max_decompressed_size: Option<usize>,
+    ) -> lopdf::Result<Self> {
+        Self::from_doc_pages_inner(doc, None, false, max_decompressed_size)
     }
 
     /// Build FontCMaps for specific pages only. Pass `None` for all pages.
     pub fn from_doc_pages(doc: &Document, page_filter: Option<&HashSet<u32>>) -> Self {
-        Self::from_doc_pages_inner(doc, page_filter, false)
+        Self::from_doc_pages_inner(doc, page_filter, false, None)
+            .expect("unbounded CMap collection never returns a size error")
     }
 
     /// Build FontCMaps in fast mode: skip expensive TrueType font fallback
@@ -2052,14 +2536,16 @@ impl FontCMaps {
     /// which triggers `needs_ocr` fallback. This is ideal for hybrid OCR
     /// pipelines where GPU OCR is always available as a fallback.
     pub fn from_doc_pages_fast(doc: &Document, page_filter: Option<&HashSet<u32>>) -> Self {
-        Self::from_doc_pages_inner(doc, page_filter, true)
+        Self::from_doc_pages_inner(doc, page_filter, true, None)
+            .expect("unbounded CMap collection never returns a size error")
     }
 
     fn from_doc_pages_inner(
         doc: &Document,
         page_filter: Option<&HashSet<u32>>,
         skip_truetype_fallback: bool,
-    ) -> Self {
+        max_decompressed_size: Option<usize>,
+    ) -> lopdf::Result<Self> {
         let mut by_obj_num: HashMap<u32, CMapEntry> = HashMap::new();
 
         for (page_num, &page_id) in doc.get_pages().iter() {
@@ -2075,15 +2561,21 @@ impl FontCMaps {
                 doc,
                 &mut by_obj_num,
                 skip_truetype_fallback,
-            );
+                max_decompressed_size,
+            )?;
 
             if !skip_truetype_fallback {
                 // Fonts inside Form XObjects referenced by this page
-                Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
+                Self::collect_cmaps_from_xobjects(
+                    doc,
+                    page_id,
+                    &mut by_obj_num,
+                    max_decompressed_size,
+                )?;
             }
         }
 
-        FontCMaps { by_obj_num }
+        Ok(FontCMaps { by_obj_num })
     }
 
     /// Parse ToUnicode CMaps from a set of font dictionaries.
@@ -2093,8 +2585,15 @@ impl FontCMaps {
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
-    ) {
-        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
+        max_decompressed_size: Option<usize>,
+    ) -> lopdf::Result<()> {
+        Self::collect_cmaps_from_fonts_inner(
+            fonts,
+            doc,
+            by_obj_num,
+            false,
+            max_decompressed_size,
+        )
     }
 
     fn collect_cmaps_from_fonts_inner(
@@ -2102,7 +2601,8 @@ impl FontCMaps {
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
         skip_truetype_fallback: bool,
-    ) {
+        max_decompressed_size: Option<usize>,
+    ) -> lopdf::Result<()> {
         // First pass: collect ToUnicode CMaps
         for font_dict in fonts.values() {
             let obj_ref = match font_dict
@@ -2121,10 +2621,8 @@ impl FontCMaps {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let data = match stream.decompressed_content() {
-                Ok(d) => d,
-                Err(_) => stream.content.clone(),
-            };
+            let data =
+                crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
             if let Some(cmap) = ToUnicodeCMap::parse(&data) {
                 debug!(
                     "CMap obj={:<6} code_byte_length={} char_map={} ranges={}",
@@ -2133,8 +2631,13 @@ impl FontCMaps {
                     cmap.char_map.len(),
                     cmap.ranges.len()
                 );
-                let (mut primary, mut remapped) =
-                    try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+                let (mut primary, mut remapped) = try_remap_subset_cmap_with_limit(
+                    cmap,
+                    font_dict,
+                    doc,
+                    obj_num,
+                    max_decompressed_size,
+                )?;
 
                 // Only build expensive fallbacks when the primary CMap is sparse.
                 // build_fallback_cmap_for_type0 can take seconds on large embedded
@@ -2144,21 +2647,48 @@ impl FontCMaps {
                 let mut fallback = if primary_entries < 10 && !skip_truetype_fallback {
                     // Try cheap fallback first; only attempt expensive TrueType
                     // parsing if cheap fallbacks don't yield results.
-                    let cheap = build_fallback_tounicode_from_encoding(font_dict, doc)
-                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
-                    if cheap.is_some() {
-                        cheap
+                    if let Some(cmap) = build_fallback_tounicode_from_encoding_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )? {
+                        Some(cmap)
+                    } else if let Some(cmap) = build_fallback_cmap_for_simple_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )? {
+                        Some(cmap)
                     } else {
-                        build_fallback_cmap_for_type0(font_dict, doc)
+                        build_fallback_cmap_for_type0_with_limit(
+                            font_dict,
+                            doc,
+                            max_decompressed_size,
+                        )?
                     }
                 } else if primary_entries < 10 {
                     // Fast mode: only try cheap fallbacks, skip TrueType parsing.
                     // Regions using this font will get needs_ocr=true.
-                    build_fallback_tounicode_from_encoding(font_dict, doc)
-                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
+                    if let Some(cmap) = build_fallback_tounicode_from_encoding_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )? {
+                        Some(cmap)
+                    } else {
+                        build_fallback_cmap_for_simple_with_limit(
+                            font_dict,
+                            doc,
+                            max_decompressed_size,
+                        )?
+                    }
                 } else {
                     // Primary is rich enough; only try the cheap encoding fallback
-                    build_fallback_tounicode_from_encoding(font_dict, doc)
+                    build_fallback_tounicode_from_encoding_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )?
                 };
 
                 if primary_entries < 10 {
@@ -2180,12 +2710,26 @@ impl FontCMaps {
                     },
                 );
             } else {
-                // ToUnicode present but parse failed; try fallbacks to avoid empty decoding.
                 let fallback = if skip_truetype_fallback {
-                    build_fallback_cmap_for_simple(font_dict, doc)
+                    build_fallback_cmap_for_simple_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )?
+                } else if let Some(cmap) =
+                    build_fallback_cmap_for_type0_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )?
+                {
+                    Some(cmap)
                 } else {
-                    build_fallback_cmap_for_type0(font_dict, doc)
-                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
+                    build_fallback_cmap_for_simple_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )?
                 };
                 if let Some(fb) = fallback {
                     debug!(
@@ -2205,25 +2749,33 @@ impl FontCMaps {
             }
         }
 
-        // Second pass: Identity-H/V fonts without ToUnicode
-        // Try: (1) embedded TrueType/OpenType cmap, (2) predefined CID→Unicode mapping
+        // Second pass: Identity Type0 CID fonts without ToUnicode. Non-Identity
+        // encoding CMaps are resource-scoped and are installed inline by the
+        // page/Form extraction paths, not under a shared FontFile/CIDFont key.
         // Skip entirely in fast mode — these fonts require expensive TrueType parsing.
         if skip_truetype_fallback {
-            return;
+            return Ok(());
         }
         for font_dict in fonts.values() {
             if font_dict.get(b"ToUnicode").is_ok() {
                 continue;
             }
-            let encoding = match font_dict
-                .get(b"Encoding")
+            let is_type0 = font_dict
+                .get(b"Subtype")
                 .ok()
-                .and_then(|o| o.as_name().ok())
-            {
-                Some(name) => name,
-                None => continue,
-            };
-            if encoding != b"Identity-H" && encoding != b"Identity-V" {
+                .and_then(|subtype| subtype.as_name().ok())
+                == Some(b"Type0");
+            if !is_type0 {
+                continue;
+            }
+            let is_identity_encoding = matches!(
+                font_dict
+                    .get(b"Encoding")
+                    .ok()
+                    .and_then(|encoding| encoding.as_name().ok()),
+                Some(b"Identity-H") | Some(b"Identity-V")
+            );
+            if !is_identity_encoding {
                 continue;
             }
             // Navigate: DescendantFonts[0]
@@ -2287,13 +2839,12 @@ impl FontCMaps {
                 continue;
             }
 
+
             // Try parsing embedded TrueType/OpenType cmap
             if let Some(ff_ref) = font_file_ref {
                 if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                    let data = match stream.decompressed_content() {
-                        Ok(d) => d,
-                        Err(_) => stream.content.clone(),
-                    };
+                    let data =
+                        crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
                     if let Some(cmap) = build_cmap_from_truetype(&data) {
                         debug!(
                             "TrueType CMap obj={:<6} (embedded font) char_map={}",
@@ -2413,7 +2964,9 @@ impl FontCMaps {
                 continue;
             }
             if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                if let Ok(data) = stream.decompressed_content() {
+                if let Some(data) =
+                    crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+                {
                     if let Some(cmap) = build_simple_cmap_from_truetype(&data) {
                         debug!(
                             "Simple font cmap obj={:<6} (embedded font) char_map={}",
@@ -2432,6 +2985,7 @@ impl FontCMaps {
                 }
             }
         }
+        Ok(())
     }
 
     /// Walk Form XObjects in a page's resources and collect their font CMaps.
@@ -2439,22 +2993,36 @@ impl FontCMaps {
         doc: &Document,
         page_id: ObjectId,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
-    ) {
+        max_decompressed_size: Option<usize>,
+    ) -> lopdf::Result<()> {
         let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
-            Ok(r) => r,
-            Err(_) => return,
+            Ok(resources) => resources,
+            Err(_) => return Ok(()),
         };
 
         let mut visited = HashSet::new();
 
         if let Some(resources) = resource_dict {
-            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            Self::walk_xobject_fonts(
+                resources,
+                doc,
+                by_obj_num,
+                &mut visited,
+                max_decompressed_size,
+            )?;
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+                Self::walk_xobject_fonts(
+                    resources,
+                    doc,
+                    by_obj_num,
+                    &mut visited,
+                    max_decompressed_size,
+                )?;
             }
         }
+        Ok(())
     }
 
     /// Recursively collect font CMaps from XObjects in a resource dictionary.
@@ -2463,18 +3031,18 @@ impl FontCMaps {
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
         visited: &mut HashSet<ObjectId>,
-    ) {
+        max_decompressed_size: Option<usize>,
+    ) -> lopdf::Result<()> {
         let xobject_dict = match resources.get(b"XObject") {
             Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
-            Ok(Object::Dictionary(dict)) => Some(dict),
+            Ok(Object::Dictionary(dictionary)) => Some(dictionary),
             _ => None,
         };
-        let xobject_dict = match xobject_dict {
-            Some(d) => d,
-            None => return,
+        let Some(xobject_dict) = xobject_dict else {
+            return Ok(());
         };
 
-        for (_name, value) in xobject_dict.iter() {
+        for value in xobject_dict.values() {
             let id = match value {
                 Object::Reference(id) => *id,
                 _ => continue,
@@ -2483,14 +3051,14 @@ impl FontCMaps {
                 continue;
             }
             let stream = match doc.get_object(id).and_then(Object::as_stream) {
-                Ok(s) => s,
+                Ok(stream) => stream,
                 Err(_) => continue,
             };
             let is_form = stream
                 .dict
                 .get(b"Subtype")
-                .and_then(|o| o.as_name())
-                .is_ok_and(|n| n == b"Form");
+                .and_then(|object| object.as_name())
+                .is_ok_and(|name| name == b"Form");
             if !is_form {
                 continue;
             }
@@ -2499,7 +3067,7 @@ impl FontCMaps {
                 // Extract font dict from the Form's resources
                 let font_dict_obj = match form_resources.get(b"Font") {
                     Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
-                    Ok(Object::Dictionary(dict)) => Some(dict),
+                    Ok(Object::Dictionary(dictionary)) => Some(dictionary),
                     _ => None,
                 };
                 if let Some(font_dict) = font_dict_obj {
@@ -2507,19 +3075,31 @@ impl FontCMaps {
                     for (name, value) in font_dict.iter() {
                         let font = match value {
                             Object::Reference(id) => doc.get_dictionary(*id).ok(),
-                            Object::Dictionary(dict) => Some(dict),
+                            Object::Dictionary(dictionary) => Some(dictionary),
                             _ => None,
                         };
                         if let Some(font) = font {
                             fonts.insert(name.clone(), font);
                         }
                     }
-                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
+                    Self::collect_cmaps_from_fonts(
+                        &fonts,
+                        doc,
+                        by_obj_num,
+                        max_decompressed_size,
+                    )?;
                 }
                 // Recurse into nested XObjects
-                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+                Self::walk_xobject_fonts(
+                    form_resources,
+                    doc,
+                    by_obj_num,
+                    visited,
+                    max_decompressed_size,
+                )?;
             }
         }
+        Ok(())
     }
 
     /// Get a CMap by ToUnicode object number
@@ -2534,74 +3114,106 @@ fn build_fallback_cmap_for_type0(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<ToUnicodeCMap> {
-    let subtype = font_dict.get(b"Subtype").ok()?.as_name().ok()?;
+    build_fallback_cmap_for_type0_with_limit(font_dict, doc, None)
+        .expect("unbounded Type0 CMap reads never return a size error")
+}
+
+fn build_fallback_cmap_for_type0_with_limit(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<ToUnicodeCMap>> {
+    let Some(subtype) = font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+    else {
+        return Ok(None);
+    };
     if subtype != b"Type0" {
-        return None;
+        return Ok(None);
     }
-    let encoding = font_dict
+    let Some(encoding) = font_dict
         .get(b"Encoding")
         .ok()
-        .and_then(|o| o.as_name().ok())?;
+        .and_then(|object| object.as_name().ok())
+    else {
+        return Ok(None);
+    };
     if encoding != b"Identity-H" && encoding != b"Identity-V" {
-        return None;
+        return Ok(None);
     }
 
-    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
-    let desc_fonts = match desc_fonts_obj {
-        Object::Array(arr) => arr,
-        Object::Reference(r) => match doc.get_object(*r) {
-            Ok(Object::Array(arr)) => arr,
-            _ => return None,
-        },
-        _ => return None,
+    let Some(desc_fonts_obj) = font_dict.get(b"DescendantFonts").ok() else {
+        return Ok(None);
     };
-    if desc_fonts.is_empty() {
-        return None;
-    }
-    let cid_font_dict = match &desc_fonts[0] {
-        Object::Reference(r) => doc.get_dictionary(*r).ok()?,
-        Object::Dictionary(d) => d,
-        _ => return None,
+    let desc_fonts = match desc_fonts_obj {
+        Object::Array(array) => array,
+        Object::Reference(reference) => match doc.get_object(*reference) {
+            Ok(Object::Array(array)) => array,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let Some(cid_font) = desc_fonts.first() else {
+        return Ok(None);
+    };
+    let cid_font_dict = match cid_font {
+        Object::Reference(reference) => match doc.get_dictionary(*reference) {
+            Ok(dictionary) => dictionary,
+            Err(_) => return Ok(None),
+        },
+        Object::Dictionary(dictionary) => dictionary,
+        _ => return Ok(None),
     };
 
     let font_descriptor = cid_font_dict
         .get(b"FontDescriptor")
         .ok()
-        .and_then(|o| match o {
-            Object::Reference(r) => doc.get_dictionary(*r).ok(),
-            Object::Dictionary(d) => Some(d),
+        .and_then(|object| match object {
+            Object::Reference(reference) => doc.get_dictionary(*reference).ok(),
+            Object::Dictionary(dictionary) => Some(dictionary),
             _ => None,
         });
 
-    let font_file_ref = font_descriptor.and_then(|fd| {
-        fd.get(b"FontFile2")
+    let font_file_ref = font_descriptor.and_then(|descriptor| {
+        descriptor
+            .get(b"FontFile2")
             .ok()
-            .and_then(|o| o.as_reference().ok())
+            .and_then(|object| object.as_reference().ok())
             .or_else(|| {
-                fd.get(b"FontFile3")
+                descriptor
+                    .get(b"FontFile3")
                     .ok()
-                    .and_then(|o| o.as_reference().ok())
+                    .and_then(|object| object.as_reference().ok())
             })
     });
 
-    if let Some(ff_ref) = font_file_ref {
-        if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-            if let Ok(data) = stream.decompressed_content() {
+    if let Some(font_file_ref) = font_file_ref {
+        if let Ok(stream) = doc.get_object(font_file_ref).and_then(Object::as_stream) {
+            if let Some(data) =
+                crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+            {
                 if let Some(cmap) = build_cmap_from_truetype(&data) {
-                    if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
-                        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
+                    if let Some(cid_to_gid) = get_cid_to_gid_map_with_limit(
+                        cid_font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )? {
+                        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid)
+                        {
                             debug!(
                                 "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
                                 repaired.char_map.len()
                             );
-                            return Some(repaired);
+                            return Ok(Some(repaired));
                         }
                     }
                     debug!(
                         "Fallback TrueType CMap (Type0+ToUnicode) char_map={}",
                         cmap.char_map.len()
                     );
-                    return Some(cmap);
+                    return Ok(Some(cmap));
                 }
             }
         }
@@ -2612,55 +3224,118 @@ fn build_fallback_cmap_for_type0(
             "Fallback CIDSystemInfo CMap (Type0+ToUnicode) char_map={}",
             cmap.char_map.len()
         );
-        return Some(cmap);
+        return Ok(Some(cmap));
     }
 
-    None
+    Ok(None)
 }
 
 fn build_fallback_cmap_for_simple(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<ToUnicodeCMap> {
-    let subtype = font_dict.get(b"Subtype").ok()?.as_name().ok()?;
+    build_fallback_cmap_for_simple_with_limit(font_dict, doc, None)
+        .expect("unbounded simple CMap reads never return a size error")
+}
+
+fn build_fallback_cmap_for_simple_with_limit(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    max_decompressed_size: Option<usize>,
+) -> lopdf::Result<Option<ToUnicodeCMap>> {
+    let Some(subtype) = font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+    else {
+        return Ok(None);
+    };
     if subtype == b"Type0" {
-        return None;
+        return Ok(None);
     }
-    let font_descriptor = font_dict
+    let Some(font_descriptor) = font_dict
         .get(b"FontDescriptor")
         .ok()
-        .and_then(|o| match o {
-            Object::Reference(r) => doc.get_dictionary(*r).ok(),
-            Object::Dictionary(d) => Some(d),
+        .and_then(|object| match object {
+            Object::Reference(reference) => doc.get_dictionary(*reference).ok(),
+            Object::Dictionary(dictionary) => Some(dictionary),
             _ => None,
-        })?;
-    let font_file_ref = font_descriptor
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(font_file_ref) = font_descriptor
         .get(b"FontFile2")
         .ok()
-        .and_then(|o| o.as_reference().ok())
+        .and_then(|object| object.as_reference().ok())
         .or_else(|| {
             font_descriptor
                 .get(b"FontFile3")
                 .ok()
-                .and_then(|o| o.as_reference().ok())
-        })?;
-    if let Ok(stream) = doc.get_object(font_file_ref).and_then(Object::as_stream) {
-        if let Ok(data) = stream.decompressed_content() {
-            if let Some(cmap) = build_simple_cmap_from_truetype(&data) {
-                debug!(
-                    "Fallback simple font cmap (ToUnicode present) char_map={}",
-                    cmap.char_map.len()
-                );
-                return Some(cmap);
-            }
-        }
-    }
-    None
+                .and_then(|object| object.as_reference().ok())
+        })
+    else {
+        return Ok(None);
+    };
+    let Ok(stream) = doc.get_object(font_file_ref).and_then(Object::as_stream) else {
+        return Ok(None);
+    };
+    let Some(data) =
+        crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+    else {
+        return Ok(None);
+    };
+    let Some(cmap) = build_simple_cmap_from_truetype(&data) else {
+        return Ok(None);
+    };
+    debug!(
+        "Fallback simple font cmap (ToUnicode present) char_map={}",
+        cmap.char_map.len()
+    );
+    Ok(Some(cmap))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
+
+    #[cfg(feature = "builtin_cmaps")]
+    #[test]
+    fn builtin_cmap_decodes_unigb_ucs2_without_tounicode() {
+        let doc = Document::new();
+        let font_dict = lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "Encoding" => "UniGB-UCS2-H",
+            "DescendantFonts" => vec![Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType0",
+                "CIDSystemInfo" => lopdf::dictionary! {
+                    "Registry" => Object::string_literal("Adobe"),
+                    "Ordering" => Object::string_literal("GB1"),
+                    "Supplement" => 0,
+                },
+            })],
+        };
+
+        let data =
+            read_builtin_cmap_file("UniGB-UCS2-H.bcmap").expect("UniGB-UCS2-H must be embedded");
+        let encoding =
+            parse_binary_cmap_encoding(&data).expect("UniGB-UCS2-H must parse from embedded CMaps");
+        let cid = encoding
+            .map
+            .get(&0x4E2D)
+            .copied()
+            .expect("UniGB-UCS2-H must map the UTF-16BE code for 中");
+        let ucs2 = build_cmap_from_builtin_cmap("GB1")
+            .expect("Adobe-GB1-UCS2 must load from embedded CMaps");
+        assert_eq!(ucs2.lookup(cid).as_deref(), Some("中"));
+
+        let entry = build_cmap_entry_from_encoding_fallback(&font_dict, &doc)
+            .expect("UniGB-UCS2-H must resolve through embedded CMaps");
+        assert_eq!(entry.primary.lookup(0x4E2D).as_deref(), Some("中"));
+    }
 
     #[test]
     fn test_parse_bfchar_2byte() {

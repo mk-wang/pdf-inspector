@@ -15,11 +15,13 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
-    CMapDecisionCache, FontStyleCache,
+    descriptor_style_flags_with_limit, extract_text_from_operand, get_font_file2_obj_num,
+    get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
+use super::xobjects::{
+    extract_form_xobject_text_with_limit, get_page_xobjects, FormWalkBudget, XObjectType,
+};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
@@ -151,6 +153,28 @@ pub(crate) fn extract_page_text_items(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
+    extract_page_text_items_with_limit(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        include_invisible,
+        style_cache,
+        form_budget,
+        None,
+    )
+}
+
+pub(crate) fn extract_page_text_items_with_limit(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+    max_decompressed_size: Option<usize>,
+) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -200,29 +224,40 @@ pub(crate) fn extract_page_text_items(
         }
         // Descriptor style flags rescue subset fonts whose BaseFont names
         // are opaque tags the name heuristics can't read.
-        let style = descriptor_style_flags(doc, font_dict, style_cache);
+        let style =
+            descriptor_style_flags_with_limit(doc, font_dict, style_cache, max_decompressed_size)?;
         if style != (false, false) {
             font_style_flags.insert(resource_name.clone(), style);
         }
-        // Track ToUnicode object reference, with FontFile2 fallback for Identity-H/V.
-        // Also handle inline ToUnicode streams.
+        // Track ToUnicode object references, with a direct-CID-font fallback.
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
-                    if let Some(entry) =
-                        crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
-                    {
+                    let data =
+                        crate::decompressed_stream_content_or_raw(s, max_decompressed_size)?;
+                    if let Some(entry) = crate::tounicode::build_cmap_entry_from_stream_with_limit(
+                        &data,
+                        font_dict,
+                        doc,
+                        0,
+                        max_decompressed_size,
+                    )? {
                         inline_cmaps.insert(resource_name, entry);
                     }
                 }
             }
             Err(_) => {
-                if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
+                if let Some(entry) =
+                    crate::tounicode::build_cmap_entry_from_encoding_fallback_with_limit(
+                        font_dict,
+                        doc,
+                        max_decompressed_size,
+                    )?
+                {
+                    inline_cmaps.insert(resource_name, entry);
+                } else if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
                     font_tounicode_refs.insert(resource_name, ff2_obj_num);
                 }
             }
@@ -234,8 +269,21 @@ pub(crate) fn extract_page_text_items(
     let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
     for (font_name, font_dict) in &fonts {
         let name = String::from_utf8_lossy(font_name).to_string();
-        if let Ok(enc) = font_dict.get_font_encoding(doc) {
-            encoding_cache.insert(name, enc);
+        match max_decompressed_size {
+            Some(limit) => match font_dict.get_font_encoding_with_limit(doc, limit) {
+                Ok(encoding) => {
+                    encoding_cache.insert(name, encoding);
+                }
+                Err(error) if crate::is_decompression_limit_error(&error) => {
+                    return Err(error.into());
+                }
+                Err(_) => {}
+            },
+            None => {
+                if let Ok(encoding) = font_dict.get_font_encoding(doc) {
+                    encoding_cache.insert(name, encoding);
+                }
+            }
         }
     }
 
@@ -244,10 +292,10 @@ pub(crate) fn extract_page_text_items(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content
-    let content_data = doc
-        .get_page_content(page_id)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
+    let content_data = match max_decompressed_size {
+        Some(limit) => doc.get_page_content_with_limit(page_id, limit)?,
+        None => doc.get_page_content(page_id),
+    };
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
@@ -909,7 +957,7 @@ pub(crate) fn extract_page_text_items(
                                 }
                                 XObjectType::Form(form_id) => {
                                     // Extract text from Form XObject
-                                    let form_items = extract_form_xobject_text(
+                                    let form_items = extract_form_xobject_text_with_limit(
                                         doc,
                                         *form_id,
                                         page_num,
@@ -918,7 +966,8 @@ pub(crate) fn extract_page_text_items(
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
-                                    );
+                                        max_decompressed_size,
+                                    )?;
                                     items.extend(form_items);
                                 }
                             }
