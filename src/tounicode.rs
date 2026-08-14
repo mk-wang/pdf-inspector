@@ -3042,7 +3042,7 @@ impl FontCMaps {
             return Ok(());
         };
 
-        for value in xobject_dict.values() {
+        for (_name, value) in xobject_dict.iter() {
             let id = match value {
                 Object::Reference(id) => *id,
                 _ => continue,

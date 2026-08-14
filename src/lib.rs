@@ -4064,7 +4064,7 @@ fn process_document(
         // recovery error that must stop processing.
         if pdf_type == PdfType::Mixed {
             match result {
-                Ok((items, thresholds, gid_encoded_pages)) => {
+                Ok(((items, _rects, _lines), thresholds, gid_encoded_pages)) => {
                     let sample: String = items
                         .iter()
                         .filter(|item| {
@@ -4084,7 +4084,7 @@ fn process_document(
                             options.max_decompressed_size,
                         )
                     } else {
-                        Ok((items, thresholds, gid_encoded_pages))
+                        Ok(((items, _rects, _lines), thresholds, gid_encoded_pages))
                     }
                 }
                 Err(error) if !error.is_decompression_limit() => {
