@@ -382,6 +382,201 @@ fn recover_unclaimed_header_row(table: &mut Table, items: &[TextItem], has_ragge
     table.item_indices.sort_unstable();
     table.item_indices.dedup();
 }
+fn align_unclaimed_row(
+    row_items: &[(usize, &TextItem)],
+    columns: &[f32],
+) -> Option<(Vec<String>, Vec<usize>, usize)> {
+    if row_items.is_empty() || row_items.len() > columns.len() {
+        return None;
+    }
+
+    let row_xs: Vec<f32> = row_items.iter().map(|(_, item)| item.x).collect();
+    let assignments = align_positions_to_columns(&row_xs, columns);
+    if assignments.len() != row_items.len() {
+        return None;
+    }
+
+    let mut cells = vec![String::new(); columns.len()];
+    let mut indices = Vec::with_capacity(row_items.len());
+    let mut populated_columns = HashSet::new();
+    for ((idx, item), col_idx) in row_items.iter().zip(assignments) {
+        let text = item.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !cells[col_idx].is_empty() {
+            cells[col_idx].push(' ');
+        }
+        cells[col_idx].push_str(text);
+        indices.push(*idx);
+        populated_columns.insert(col_idx);
+    }
+
+    Some((cells, indices, populated_columns.len()))
+}
+
+fn is_short_uppercase_label(row_items: &[(usize, &TextItem)]) -> bool {
+    let text = row_items
+        .iter()
+        .map(|(_, item)| item.text.trim())
+        .collect::<String>();
+    let alphabetic = text.chars().filter(|ch| ch.is_alphabetic()).count();
+
+    alphabetic > 0
+        && text.chars().count() <= 8
+        && text
+            .chars()
+            .all(|ch| !ch.is_alphabetic() || ch.is_uppercase())
+}
+
+/// Recover a partial leading data row whose sibling cells were omitted from
+/// the structure tree, plus any immediately preceding rows on the same grid.
+fn recover_unclaimed_leading_table_rows(
+    table: &mut Table,
+    items: &[TextItem],
+    has_ragged_rows: bool,
+) -> bool {
+    const MAX_LEADING_DISTANCE: f32 = 90.0;
+    const MAX_ROW_GAP: f32 = 25.0;
+    const MAX_LEADING_ROWS: usize = 3;
+    const Y_TOLERANCE: f32 = 5.0;
+
+    if !has_ragged_rows || table.rows.is_empty() || table.columns.len() < 3 {
+        return false;
+    }
+
+    let top_row_y = table.rows[0];
+    let x_min = table.columns.first().copied().unwrap_or(0.0) - 25.0;
+    let x_max = table.columns.last().copied().unwrap_or(0.0) + 120.0;
+    let claimed: HashSet<usize> = table.item_indices.iter().copied().collect();
+    let mut candidate_rows: Vec<(f32, Vec<(usize, &TextItem)>)> = Vec::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        if claimed.contains(&idx)
+            || item.text.trim().is_empty()
+            || item.y < top_row_y - Y_TOLERANCE
+            || item.y - top_row_y > MAX_LEADING_DISTANCE
+            || item.x < x_min
+            || item.x > x_max
+        {
+            continue;
+        }
+
+        if let Some((_, row_items)) = candidate_rows
+            .iter_mut()
+            .find(|(row_y, _)| (item.y - *row_y).abs() < Y_TOLERANCE)
+        {
+            row_items.push((idx, item));
+        } else {
+            candidate_rows.push((item.y, vec![(idx, item)]));
+        }
+    }
+
+    candidate_rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, row_items) in &mut candidate_rows {
+        row_items.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+    }
+
+    let Some((partial_row_y, partial_row_items)) = candidate_rows.first() else {
+        return false;
+    };
+    let partial_row_y = *partial_row_y;
+    if (partial_row_y - top_row_y).abs() > Y_TOLERANCE {
+        return false;
+    }
+
+    let Some((recovered_cells, recovered_indices, _)) =
+        align_unclaimed_row(partial_row_items, &table.columns)
+    else {
+        return false;
+    };
+    let mut merged_cells = table.cells[0].clone();
+    if merged_cells.len() != table.columns.len() {
+        return false;
+    }
+    for (cell, recovered) in merged_cells.iter_mut().zip(recovered_cells) {
+        if recovered.is_empty() {
+            continue;
+        }
+        if !cell.is_empty() {
+            return false;
+        }
+        *cell = recovered;
+    }
+
+    let required_columns = table.columns.len().saturating_sub(1).max(2);
+    if recovered_indices.is_empty()
+        || merged_cells.iter().filter(|cell| !cell.is_empty()).count() < required_columns
+    {
+        return false;
+    }
+
+    table.cells[0] = merged_cells;
+    table.item_indices.extend(recovered_indices);
+
+    let mut leading_rows = Vec::new();
+    let mut previous_y = partial_row_y;
+    let mut has_leading_data_row = false;
+    for (row_y, row_items) in candidate_rows.into_iter().skip(1) {
+        if leading_rows.len() >= MAX_LEADING_ROWS || row_y - previous_y > MAX_ROW_GAP {
+            break;
+        }
+        previous_y = row_y;
+
+        let Some((cells, indices, populated_columns)) =
+            align_unclaimed_row(&row_items, &table.columns)
+        else {
+            break;
+        };
+        let is_data_row = populated_columns >= required_columns;
+        if !is_data_row && !is_short_uppercase_label(&row_items) {
+            break;
+        }
+        has_leading_data_row |= is_data_row;
+        leading_rows.push((row_y, cells, indices));
+    }
+
+    if has_leading_data_row {
+        for (row_y, cells, indices) in leading_rows {
+            table.rows.insert(0, row_y);
+            table.cells.insert(0, cells);
+            table.item_indices.extend(indices);
+        }
+    }
+    table.item_indices.sort_unstable();
+    table.item_indices.dedup();
+    true
+}
+
+fn has_unclaimed_items_in_table_rows(table: &Table, items: &[TextItem]) -> bool {
+    const ROW_TOLERANCE: f32 = 5.0;
+
+    let claimed: HashSet<usize> = table.item_indices.iter().copied().collect();
+    let x_min = table
+        .columns
+        .iter()
+        .copied()
+        .reduce(f32::min)
+        .unwrap_or(0.0)
+        - 25.0;
+    let x_max = table
+        .columns
+        .iter()
+        .copied()
+        .reduce(f32::max)
+        .unwrap_or(0.0)
+        + 120.0;
+
+    items.iter().enumerate().any(|(idx, item)| {
+        !claimed.contains(&idx)
+            && item.x >= x_min
+            && item.x <= x_max
+            && table
+                .rows
+                .iter()
+                .any(|&row_y| (item.y - row_y).abs() <= ROW_TOLERANCE)
+    })
+}
 
 /// Build tables from structure-tree table descriptors by matching MCIDs to TextItems.
 ///
@@ -546,23 +741,28 @@ pub fn detect_tables_from_struct_tree(
             aligned_cells,
             aligned_item_indices,
         );
+        let recovery_eligible = has_ragged_rows && !first_row_has_tagged_header;
+        let recovered_leading_rows =
+            recover_unclaimed_leading_table_rows(&mut aligned_table, items, recovery_eligible);
         let item_count_before_header = aligned_table.item_indices.len();
         let row_count_before_header = aligned_table.cells.len();
-        recover_unclaimed_header_row(
-            &mut aligned_table,
-            items,
-            has_ragged_rows && !first_row_has_tagged_header,
-        );
+        recover_unclaimed_header_row(&mut aligned_table, items, recovery_eligible);
 
         let recovered_header = aligned_table.item_indices.len() > item_count_before_header
             || aligned_table.cells.len() > row_count_before_header;
-        let prefer_aligned = recovered_header;
-
-        tables.push(if prefer_aligned {
+        let table = if recovered_leading_rows || recovered_header {
             aligned_table
         } else {
             legacy_table
-        });
+        };
+        if has_unclaimed_items_in_table_rows(&table, items) {
+            debug!(
+                "page {}: rejecting structural table with unclaimed items in matched rows",
+                page
+            );
+            continue;
+        }
+        tables.push(table);
     }
 
     tables
@@ -744,6 +944,53 @@ mod tests {
         // Page 2 should find the table
         let tables = detect_tables_from_struct_tree(&items, &struct_tables, 2);
         assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn recovers_partial_struct_row_with_unclaimed_items() {
+        let items = vec![
+            make_item("Left", 50.0, 100.0, 1, Some(10)),
+            make_item("Middle", 150.0, 100.0, 1, None),
+            make_item("Right", 250.0, 100.0, 1, None),
+            make_item("Next left", 50.0, 80.0, 1, Some(20)),
+            make_item("Next middle", 150.0, 80.0, 1, Some(21)),
+            make_item("Next right", 250.0, 80.0, 1, Some(22)),
+        ];
+        let struct_tables = vec![StructTable {
+            rows: vec![
+                StructTableRow {
+                    cells: vec![StructTableCell {
+                        is_header: false,
+                        mcids: vec![(10, 1)],
+                    }],
+                },
+                StructTableRow {
+                    cells: vec![
+                        StructTableCell {
+                            is_header: false,
+                            mcids: vec![(20, 1)],
+                        },
+                        StructTableCell {
+                            is_header: false,
+                            mcids: vec![(21, 1)],
+                        },
+                        StructTableCell {
+                            is_header: false,
+                            mcids: vec![(22, 1)],
+                        },
+                    ],
+                },
+            ],
+        }];
+
+        let tables = detect_tables_from_struct_tree(&items, &struct_tables, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cells[0], vec!["Left", "Middle", "Right"]);
+        assert_eq!(
+            tables[0].cells[1],
+            vec!["Next left", "Next middle", "Next right"]
+        );
+        assert_eq!(tables[0].item_indices.len(), items.len());
     }
 
     #[test]

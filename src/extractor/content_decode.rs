@@ -202,14 +202,13 @@ mod tests {
     /// Overcount is acceptable (skip a page); undercount would re-open decode.
     fn assert_count_does_not_undercount(data: &[u8]) {
         let ours = count_content_operators(data, usize::MAX);
-        match Content::decode(data) {
-            Ok(content) => assert!(
+        if let Ok(content) = Content::decode(data) {
+            assert!(
                 ours >= content.operations.len(),
                 "undercount: ours={ours} lopdf={} for {:?}",
                 content.operations.len(),
                 String::from_utf8_lossy(data)
-            ),
-            Err(_) => {}
+            );
         }
     }
 

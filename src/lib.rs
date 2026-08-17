@@ -102,7 +102,6 @@ pub(crate) fn decompressed_stream_content_or_none(
     }
 }
 
-
 /// Decompress a stream, retaining the existing raw-byte recovery for malformed
 /// filters while propagating every decompression-limit failure.
 pub(crate) fn decompressed_stream_content_or_raw(
@@ -111,9 +110,9 @@ pub(crate) fn decompressed_stream_content_or_raw(
 ) -> lopdf::Result<Vec<u8>> {
     match decompressed_stream_content(stream, max_decompressed_size) {
         Ok(content) => Ok(content),
-        Err(error @ lopdf::Error::Decompress(
-            lopdf::DecompressError::MemoryLimitExceeded { .. },
-        )) => Err(error),
+        Err(
+            error @ lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. }),
+        ) => Err(error),
         Err(_) => {
             if let Some(limit) = max_decompressed_size {
                 if stream.content.len() > limit {
@@ -638,10 +637,10 @@ pub fn extract_pages_markdown_mem(
         // detect_from_document's Mixed-type per-page routing always sends
         // these pages to OCR; mirror that here too. Both signals share one
         // analyze_page_content pass — see page_ocr_signals's doc comment.
-        let (has_template_image, has_vector_text) = lopdf_pages
+        let (has_template_image, has_vector_text, has_unmapped_font) = lopdf_pages
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -672,6 +671,7 @@ pub fn extract_pages_markdown_mem(
         };
 
         let has_decoding_issue = has_text_quality_issue
+            || has_unmapped_font
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
         if has_decoding_issue {
             add_ocr_reason(
@@ -693,8 +693,8 @@ pub fn extract_pages_markdown_mem(
             || has_gid
             || is_garbage_text(&md)
             || has_template_image
-            || has_vector_text;
-
+            || has_vector_text
+            || has_unmapped_font;
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
         }
@@ -4140,67 +4140,63 @@ fn process_document(
         Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
-            // For TextBased PDFs with pages flagged for OCR (Identity-H or
-            // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
-            // passthrough actually produced readable text.  If a page's text
-            // is garbage, strip its items so we don't emit mojibake.
-            // Only applies to TextBased — for Mixed PDFs, OCR flags come from
-            // template images rather than font encoding issues.
-            let (items, rects, lines) =
-                if pages_needing_ocr.is_empty() || pdf_type != PdfType::TextBased {
-                    (items, rects, lines)
-                } else {
-                    let ocr_set: std::collections::HashSet<u32> =
-                        pages_needing_ocr.iter().copied().collect();
-                    // Collect text per OCR-flagged page and check quality
-                    let mut garbage_pages: std::collections::HashSet<u32> =
-                        std::collections::HashSet::new();
-                    for &pg in &ocr_set {
-                        if options
+            // TextBased pages with an Identity-H/Identity-V or Type3 font
+            // without a usable Unicode mapping are OCR candidates even when
+            // an embedded-font fallback happens to produce readable text. The
+            // fallback cannot establish that the source glyph IDs are reliable
+            // Unicode, so do not publish that page's text as Markdown.
+            // Mixed PDFs retain their best-effort text behavior because their
+            // OCR route is driven by template images rather than font mapping.
+            let unmapped_font_pages: HashSet<u32> = if pdf_type == PdfType::TextBased {
+                // Detection already scans every TextBased page for the same
+                // Identity-H/Type3 mapping signals. Reuse its complete page
+                // set rather than decompressing and parsing every content
+                // stream a second time.
+                pages_needing_ocr.iter().copied().collect()
+            } else {
+                HashSet::new()
+            };
+            let (items, rects, lines) = if unmapped_font_pages.is_empty() {
+                (items, rects, lines)
+            } else {
+                let suppressed_pages: HashSet<u32> = unmapped_font_pages
+                    .into_iter()
+                    .filter(|page| {
+                        options
                             .page_filter
                             .as_ref()
-                            .is_some_and(|filter| !filter.contains(&pg))
-                        {
-                            continue;
-                        }
-                        let page_text: String = items
-                            .iter()
-                            .filter(|i| i.page == pg)
-                            .map(|i| i.text.as_str())
-                            .collect();
-                        if is_cid_garbage(&page_text) {
-                            garbage_pages.insert(pg);
-                        }
-                    }
-                    if garbage_pages.is_empty() {
-                        (items, rects, lines)
-                    } else {
-                        log::debug!(
-                            "suppressing garbage text from OCR-flagged pages: {:?}",
-                            garbage_pages
+                            .is_none_or(|filter| filter.contains(page))
+                    })
+                    .collect();
+                if suppressed_pages.is_empty() {
+                    (items, rects, lines)
+                } else {
+                    log::debug!(
+                        "suppressing unreliable text from OCR-flagged pages: {:?}",
+                        suppressed_pages
+                    );
+                    for page in &suppressed_pages {
+                        add_ocr_reason(
+                            &mut ocr_reasons_by_page,
+                            *page,
+                            OCR_REASON_SUSPECTED_GARBLED_TEXT,
                         );
-                        for page in &garbage_pages {
-                            add_ocr_reason(
-                                &mut ocr_reasons_by_page,
-                                *page,
-                                OCR_REASON_SUSPECTED_GARBLED_TEXT,
-                            );
-                        }
-                        let items: Vec<_> = items
-                            .into_iter()
-                            .filter(|i| !garbage_pages.contains(&i.page))
-                            .collect();
-                        let rects: Vec<_> = rects
-                            .into_iter()
-                            .filter(|r| !garbage_pages.contains(&r.page))
-                            .collect();
-                        let lines: Vec<_> = lines
-                            .into_iter()
-                            .filter(|l| !garbage_pages.contains(&l.page))
-                            .collect();
-                        (items, rects, lines)
                     }
-                };
+                    let items: Vec<_> = items
+                        .into_iter()
+                        .filter(|i| !suppressed_pages.contains(&i.page))
+                        .collect();
+                    let rects: Vec<_> = rects
+                        .into_iter()
+                        .filter(|r| !suppressed_pages.contains(&r.page))
+                        .collect();
+                    let lines: Vec<_> = lines
+                        .into_iter()
+                        .filter(|l| !suppressed_pages.contains(&l.page))
+                        .collect();
+                    (items, rects, lines)
+                }
+            };
 
             let selected_page = |page: u32| {
                 options
@@ -4336,26 +4332,10 @@ fn process_document(
         pages_needing_ocr.sort_unstable();
     }
 
-    // Detect sparse extraction: when a TEXT-BASED PDF produces very few
-    // characters per page, the text is likely embedded in images/forms
-    // that need OCR.  Flag all pages for OCR in this case.
-    // Only check when markdown was actually generated (not in Analyze mode).
-    if pdf_type == PdfType::TextBased
-        && page_count > 0
-        && pages_needing_ocr.is_empty()
-        && markdown.is_some()
-    {
-        let md_len = markdown.as_ref().map_or(0, |m| m.len());
-        let chars_per_page = md_len as f32 / page_count as f32;
-        if chars_per_page < 50.0 && md_len < 500 {
-            log::debug!(
-                "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
-                chars_per_page,
-                page_count
-            );
-            pages_needing_ocr = (1..=page_count).collect();
-        }
-    }
+    // A short but readable text layer is still usable output. Text length alone
+    // cannot distinguish a legitimate short document from a sparse overlay on an
+    // image, so it must not create an OCR route without a page-level detector
+    // signal. Image-backed and mixed pages are routed above from those signals.
 
     let markdown = if all_gid {
         log::debug!(

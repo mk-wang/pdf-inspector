@@ -360,7 +360,7 @@ fn test_pdf_type_equality() {
 #[test]
 fn test_pdf_type_clone() {
     let original = PdfType::TextBased;
-    let cloned = original.clone();
+    let cloned = original;
     assert_eq!(original, cloned);
 }
 
@@ -850,7 +850,7 @@ fn test_numbered_list_variations() {
     let lists = ["1. First", "2) Second", "10. Tenth"];
     for item in &lists {
         let md = to_markdown(item, MarkdownOptions::default());
-        assert!(md.trim().len() > 0, "Failed for: {}", item);
+        assert!(!md.trim().is_empty(), "Failed for: {}", item);
     }
 }
 
@@ -1113,9 +1113,8 @@ fn test_valid_pdf_header_not_rejected() {
     // it should fail with Parse or InvalidStructure instead.
     let truncated_pdf = b"%PDF-1.4\ntruncated content";
     let result = pdf_inspector::process_pdf_mem(truncated_pdf);
-    match result {
-        Err(PdfError::NotAPdf(_)) => panic!("Valid PDF header should not be rejected as NotAPdf"),
-        _ => {} // Parse or InvalidStructure is fine
+    if let Err(PdfError::NotAPdf(_)) = result {
+        panic!("Valid PDF header should not be rejected as NotAPdf");
     }
 }
 
@@ -1125,11 +1124,8 @@ fn test_bom_prefixed_pdf_header_not_rejected() {
     let mut bom_pdf = vec![0xEF, 0xBB, 0xBF];
     bom_pdf.extend_from_slice(b"%PDF-1.7\ntruncated");
     let result = pdf_inspector::process_pdf_mem(&bom_pdf);
-    match result {
-        Err(PdfError::NotAPdf(_)) => {
-            panic!("BOM-prefixed PDF header should not be rejected as NotAPdf")
-        }
-        _ => {} // Parse or InvalidStructure is fine
+    if let Err(PdfError::NotAPdf(_)) = result {
+        panic!("BOM-prefixed PDF header should not be rejected as NotAPdf");
     }
 }
 
@@ -1308,6 +1304,52 @@ fn test_snapshot_real_estate_pricing() {
 #[test]
 fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
+}
+
+#[test]
+fn test_2013_app2_table_semantics() {
+    let markdown = pdf_inspector::process_pdf("tests/fixtures/2013-app2.pdf")
+        .unwrap()
+        .markdown
+        .unwrap();
+    let has_table_row = |expected: &[&str]| {
+        markdown.lines().any(|line| {
+            line.strip_prefix('|')
+                .and_then(|cells| cells.strip_suffix('|'))
+                .is_some_and(|cells| cells.split('|').eq(expected.iter().copied()))
+        })
+    };
+
+    assert!(
+        has_table_row(&[
+            "233",
+            "29/10",
+            "Security Services for Perseverance School 2013",
+            "MOE",
+            "Extreme Security Services",
+            "SR48,400.00",
+        ]),
+        "missing complete row 233:\n{markdown}"
+    );
+    assert!(
+        has_table_row(&[
+            "234",
+            "5/11",
+            "Procurement of Mechanical Spares for Engine 6B",
+            "PUC",
+            "Wartsila Global Logistic Services",
+            "Euro267,537.60",
+        ]),
+        "missing complete row 234:\n{markdown}"
+    );
+    assert!(
+        has_table_row(&["", "NOV", "", "", "", ""]),
+        "November boundary is not a six-cell table row:\n{markdown}"
+    );
+    assert!(!markdown
+        .lines()
+        .any(|line| { line.contains("NOV") && !line.starts_with('|') }));
+    assert!(!markdown.lines().any(|line| line.trim() == ".00"));
 }
 
 /// First two pages of Shannon's "A Mathematical Theory of Communication"
@@ -1503,36 +1545,20 @@ fn test_extract_structure_elements_untagged_pdf_empty() {
 #[test]
 fn test_identity_h_no_tounicode_suppresses_garbage() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
-    // usable ToUnicode CMap. The raw CID bytes (e.g. 0x08 0x37, 0x0E 0x0F)
-    // contain non-ASCII high bytes and previously fell through to the
-    // per-byte Latin-1 fallback, producing high-Latin-1 mojibake that
-    // `is_cid_garbage` flagged. The Type0/CID guard in
-    // `extract_text_from_operand` now emits one U+FFFD per CID instead of
-    // mojibake; `detect_encoding_issues` trips on that and suppresses the
-    // markdown / flags the page for OCR — so we still pass this test, but
-    // via the deliberate marker path rather than by accident.
+    // usable ToUnicode CMap. The extractor may still recover real CJK text
+    // from the embedded font, but it must never fall back to Latin-1 bytes.
+    // The document-level detector remains conservative and routes the page
+    // to OCR because the source PDF has no usable ToUnicode mapping.
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
 
-    // Pre-suppression check: the raw text items must contain the U+FFFD
-    // markers that prove the Type0/CID fallback fired. This pins the
-    // mechanism so a future regression that re-enables Latin-1 mojibake
-    // would fail loudly here, not just silently change the suppression
-    // chain to one that depends on `is_cid_garbage` + high-Latin-1 chars.
     let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
     let combined: String = items.iter().map(|i| i.text.as_str()).collect();
-    assert!(
-        combined.contains('\u{FFFD}'),
-        "Type0/CID font with unparseable ToUnicode CMap should emit U+FFFD per CID; \
-         got {} chars: {:?}",
-        combined.len(),
-        &combined[..combined.len().min(100)]
-    );
     assert!(
         !combined
             .chars()
             .any(|c| ('\u{0080}'..='\u{00FF}').contains(&c)),
         "Latin-1 mojibake (high bytes) must not leak from Type0/CID fallback; got: {:?}",
-        &combined[..combined.len().min(100)]
+        combined.chars().take(100).collect::<String>()
     );
 
     let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
@@ -1549,7 +1575,7 @@ fn test_identity_h_no_tounicode_suppresses_garbage() {
         md.trim().is_empty(),
         "Garbage CID text should be suppressed, got {} chars: {:?}",
         md.len(),
-        &md[..md.len().min(100)]
+        md.chars().take(100).collect::<String>()
     );
 }
 

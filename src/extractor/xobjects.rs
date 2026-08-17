@@ -180,6 +180,7 @@ fn collect_xobjects_from_dict(
 }
 
 /// Extract text items from a Form XObject.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
@@ -299,8 +300,7 @@ fn extract_form_xobject_text_inner(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data =
-                        crate::decompressed_stream_content_or_raw(s, max_decompressed_size)?;
+                    let data = crate::decompressed_stream_content_or_raw(s, max_decompressed_size)?;
                     if let Some(entry) = crate::tounicode::build_cmap_entry_from_stream_with_limit(
                         &data,
                         font_dict,

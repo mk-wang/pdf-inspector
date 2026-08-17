@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_find_row_boundaries_descending_order() {
-        let items_data = vec![
+        let items_data = [
             make_item("A", 100.0, 500.0, 10.0),
             make_item("B", 100.0, 480.0, 10.0),
             make_item("C", 100.0, 460.0, 10.0),
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn test_find_row_boundaries_clustering() {
         // Items close together should cluster into one row
-        let items_data = vec![
+        let items_data = [
             make_item("A", 100.0, 500.0, 10.0),
             make_item("B", 200.0, 501.0, 10.0),
             make_item("C", 100.0, 480.0, 10.0),
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_find_row_boundaries_single_row() {
-        let items_data = vec![make_item("A", 100.0, 500.0, 10.0)];
+        let items_data = [make_item("A", 100.0, 500.0, 10.0)];
         let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
         let rows = find_row_boundaries(&items);
         assert_eq!(rows.len(), 1);
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_find_row_boundaries_items_at_same_y() {
-        let items_data = vec![
+        let items_data = [
             make_item("A", 100.0, 500.0, 10.0),
             make_item("B", 200.0, 500.0, 10.0),
             make_item("C", 300.0, 500.0, 10.0),

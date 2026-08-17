@@ -521,8 +521,8 @@ fn struct_role_heading_level(role: &StructRole) -> Option<usize> {
 ///
 /// When consecutive pages each have exactly one table with the same number of columns
 /// AND both pages are table-only (no non-table text), treat them as a single table.
-/// We strip their header+separator rows and append their data rows to the first page's
-/// table, then remove them from later pages.
+/// Remove each continuation's separator, and remove its first row only when it
+/// repeats the originating table's header.
 pub(super) fn merge_continuation_tables(
     page_tables: &mut std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     table_only_pages: &HashSet<u32>,
@@ -598,12 +598,13 @@ pub(super) fn merge_continuation_tables(
             for &cont_page in &continuation_pages {
                 if let Some(tables) = page_tables.get(&cont_page) {
                     let table_md = &tables[0].markdown;
-                    // Skip header row (line 1) and separator row (line 2), keep the rest
+                    let repeats_header = table_headers_match(&first_tables[0].markdown, table_md);
                     for (line_idx, line) in table_md.lines().enumerate() {
-                        if line_idx >= 2 {
-                            extra_rows.push_str(line);
-                            extra_rows.push('\n');
+                        if line_idx == 1 || (line_idx == 0 && repeats_header) {
+                            continue;
                         }
+                        extra_rows.push_str(line);
+                        extra_rows.push('\n');
                     }
                 }
             }
@@ -624,6 +625,24 @@ pub(super) fn merge_continuation_tables(
             i += 1;
         }
     }
+}
+
+fn table_headers_match(first_table: &str, continuation_table: &str) -> bool {
+    let Some(first_header) = first_table.lines().next() else {
+        return false;
+    };
+    let Some(continuation_header) = continuation_table.lines().next() else {
+        return false;
+    };
+
+    first_header
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .eq(continuation_header
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim))
 }
 
 /// Count the number of columns in a markdown table by counting `|` in the separator row.
@@ -1533,7 +1552,7 @@ mod tests {
     use super::*;
     use crate::structure_tree::StructRole;
     use crate::types::TextItem;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn make_item(text: &str, page: u32, mcid: Option<i64>) -> TextItem {
         TextItem {
@@ -1569,6 +1588,70 @@ mod tests {
         let mut item = make_item(text, page, None);
         item.y = y;
         make_line(vec![item])
+    }
+
+    #[test]
+    fn continuation_merge_preserves_a_non_header_first_row() {
+        let mut page_tables = HashMap::from([
+            (
+                1,
+                vec![PositionedMarkdown::new(
+                    700.0,
+                    0.0,
+                    "|Date|Amount|\n|---|---|\n|232|SR1|\n".into(),
+                    None,
+                )],
+            ),
+            (
+                2,
+                vec![PositionedMarkdown::new(
+                    700.0,
+                    0.0,
+                    "|233|SR2|\n|---|---|\n|234|SR3|\n".into(),
+                    None,
+                )],
+            ),
+        ]);
+
+        merge_continuation_tables(&mut page_tables, &HashSet::from([1, 2]));
+
+        assert_eq!(
+            page_tables[&1][0].markdown,
+            "|Date|Amount|\n|---|---|\n|232|SR1|\n|233|SR2|\n|234|SR3|\n"
+        );
+        assert!(!page_tables.contains_key(&2));
+    }
+
+    #[test]
+    fn continuation_merge_drops_a_repeated_header() {
+        let mut page_tables = HashMap::from([
+            (
+                1,
+                vec![PositionedMarkdown::new(
+                    700.0,
+                    0.0,
+                    "|Date|Amount|\n|---|---|\n|232|SR1|\n".into(),
+                    None,
+                )],
+            ),
+            (
+                2,
+                vec![PositionedMarkdown::new(
+                    700.0,
+                    0.0,
+                    "|Date|Amount|\n|---|---|\n|233|SR2|\n".into(),
+                    None,
+                )],
+            ),
+        ]);
+
+        merge_continuation_tables(&mut page_tables, &HashSet::from([1, 2]));
+
+        assert_eq!(
+            page_tables[&1][0].markdown,
+            "|Date|Amount|\n|---|---|\n|232|SR1|\n|233|SR2|\n"
+        );
+        assert!(!page_tables.contains_key(&2));
     }
 
     #[test]
@@ -1829,7 +1912,7 @@ mod tests {
 
     #[test]
     fn test_struct_role_heading_levels() {
-        let mcids = vec![
+        let mcids = [
             (StructRole::H1, "Title"),
             (StructRole::H2, "Section"),
             (StructRole::H3, "Subsection"),
@@ -2147,10 +2230,8 @@ mod tests {
         // 5 tagged P.
         let mut lines = Vec::new();
         let mut page_roles = HashMap::new();
-        let mut mcid = 0i64;
-
-        for i in 0..30 {
-            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid));
+        for i in 0_i64..30 {
+            let mut item = make_item(&format!("Line {i}"), 1, Some(i));
             item.y = 700.0 - (i as f32 * 15.0);
             lines.push(make_line(vec![item]));
 
@@ -2161,8 +2242,7 @@ mod tests {
             } else {
                 StructRole::P
             };
-            page_roles.insert(mcid, role);
-            mcid += 1;
+            page_roles.insert(i, role);
         }
 
         let mut roles = HashMap::new();
@@ -2188,10 +2268,8 @@ mod tests {
         // Normal document: a few headings, mostly body text
         let mut lines = Vec::new();
         let mut page_roles = HashMap::new();
-        let mut mcid = 0i64;
-
-        for i in 0..50 {
-            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid));
+        for i in 0_i64..50 {
+            let mut item = make_item(&format!("Line {i}"), 1, Some(i));
             item.y = 700.0 - (i as f32 * 14.0);
             lines.push(make_line(vec![item]));
 
@@ -2200,8 +2278,7 @@ mod tests {
             } else {
                 StructRole::P
             };
-            page_roles.insert(mcid, role);
-            mcid += 1;
+            page_roles.insert(i, role);
         }
 
         let mut roles = HashMap::new();

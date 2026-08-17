@@ -112,60 +112,6 @@ fn extract_items_json(
         .map(|items| format_items_json(&items))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{extract_items_json, format_items_json};
-    use pdf_inspector::extractor::ItemType;
-    use pdf_inspector::TextItem;
-
-    #[test]
-    fn items_json_includes_position_and_underline_metadata() {
-        let items = vec![TextItem {
-            text: "A \"quoted\" item".to_string(),
-            x: 12.345,
-            y: 67.891,
-            width: 23.456,
-            height: 9.876,
-            font: "F1".to_string(),
-            font_size: 10.0,
-            page: 2,
-            is_bold: false,
-            is_italic: true,
-            is_underline: true,
-            is_strikeout: true,
-            item_type: ItemType::Text,
-            mcid: Some(7),
-        }];
-
-        let json = format_items_json(&items);
-
-        assert!(json.contains(r#""text":"A \"quoted\" item""#));
-        assert!(json.contains(r#""page":2"#));
-        assert!(json.contains(r#""x":12.35"#));
-        assert!(json.contains(r#""is_underline":true"#));
-        assert!(json.contains(r#""item_type":"text""#));
-        assert!(json.contains(r#""mcid":7"#));
-    }
-
-    #[test]
-    fn items_json_uses_supplied_pdf_password() {
-        let path = "tests/fixtures/encrypted-secret123.pdf";
-
-        let without_password = extract_items_json(path, None, None);
-        assert!(
-            without_password.is_err(),
-            "encrypted fixture unexpectedly extracted without a password"
-        );
-
-        let json = extract_items_json(path, None, Some("secret123"))
-            .expect("correct password should decrypt positioned text");
-        assert!(
-            json.contains("Procurement"),
-            "decrypted item JSON should contain fixture text, got {json}"
-        );
-    }
-}
-
 /// Parse a page specification like "1,3,5-10,20" into a HashSet of page numbers.
 fn parse_page_spec(spec: &str) -> Result<HashSet<u32>, String> {
     let mut pages = HashSet::new();
@@ -512,5 +458,58 @@ fn main() {
             }
             process::exit(1);
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{extract_items_json, format_items_json};
+    use pdf_inspector::extractor::ItemType;
+    use pdf_inspector::TextItem;
+
+    #[test]
+    fn items_json_includes_position_and_underline_metadata() {
+        let items = vec![TextItem {
+            text: "A \"quoted\" item".to_string(),
+            x: 12.345,
+            y: 67.891,
+            width: 23.456,
+            height: 9.876,
+            font: "F1".to_string(),
+            font_size: 10.0,
+            page: 2,
+            is_bold: false,
+            is_italic: true,
+            is_underline: true,
+            is_strikeout: true,
+            item_type: ItemType::Text,
+            mcid: Some(7),
+        }];
+
+        let json = format_items_json(&items);
+
+        assert!(json.contains(r#""text":"A \"quoted\" item""#));
+        assert!(json.contains(r#""page":2"#));
+        assert!(json.contains(r#""x":12.35"#));
+        assert!(json.contains(r#""is_underline":true"#));
+        assert!(json.contains(r#""item_type":"text""#));
+        assert!(json.contains(r#""mcid":7"#));
+    }
+
+    #[test]
+    fn items_json_uses_supplied_pdf_password() {
+        let path = "tests/fixtures/encrypted-secret123.pdf";
+
+        let without_password = extract_items_json(path, None, None);
+        assert!(
+            without_password.is_err(),
+            "encrypted fixture unexpectedly extracted without a password"
+        );
+
+        let json = extract_items_json(path, None, Some("secret123"))
+            .expect("correct password should decrypt positioned text");
+        assert!(
+            json.contains("Procurement"),
+            "decrypted item JSON should contain fixture text, got {json}"
+        );
     }
 }

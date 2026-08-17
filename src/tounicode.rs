@@ -27,17 +27,6 @@ pub struct ToUnicodeCMap {
     pub cid_passthrough: bool,
 }
 
-pub(crate) fn build_cmap_entry_from_stream(
-    data: &[u8],
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-    obj_num: u32,
-) -> Option<CMapEntry> {
-    build_cmap_entry_from_stream_with_limit(data, font_dict, doc, obj_num, None)
-        .ok()
-        .flatten()
-}
-
 pub(crate) fn build_cmap_entry_from_stream_with_limit(
     data: &[u8],
     font_dict: &lopdf::Dictionary,
@@ -46,27 +35,21 @@ pub(crate) fn build_cmap_entry_from_stream_with_limit(
     max_decompressed_size: Option<usize>,
 ) -> lopdf::Result<Option<CMapEntry>> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
-        let (mut primary, mut remapped) = try_remap_subset_cmap_with_limit(
-            cmap,
+        let (mut primary, mut remapped) =
+            try_remap_subset_cmap_with_limit(cmap, font_dict, doc, obj_num, max_decompressed_size)?;
+        let mut fallback = if let Some(cmap) = build_fallback_tounicode_from_encoding_with_limit(
             font_dict,
             doc,
-            obj_num,
             max_decompressed_size,
-        )?;
-        let mut fallback =
-            if let Some(cmap) = build_fallback_tounicode_from_encoding_with_limit(
-                font_dict,
-                doc,
-                max_decompressed_size,
-            )? {
-                Some(cmap)
-            } else if let Some(cmap) =
-                build_fallback_cmap_for_type0_with_limit(font_dict, doc, max_decompressed_size)?
-            {
-                Some(cmap)
-            } else {
-                build_fallback_cmap_for_simple_with_limit(font_dict, doc, max_decompressed_size)?
-            };
+        )? {
+            Some(cmap)
+        } else if let Some(cmap) =
+            build_fallback_cmap_for_type0_with_limit(font_dict, doc, max_decompressed_size)?
+        {
+            Some(cmap)
+        } else {
+            build_fallback_cmap_for_simple_with_limit(font_dict, doc, max_decompressed_size)?
+        };
 
         let primary_entries = primary.char_map.len() + primary.ranges.len();
         if primary_entries < 10 {
@@ -864,11 +847,6 @@ fn w_array_covers_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document, target:
 }
 
 /// Extract CIDToGIDMap as a vector of GIDs (u16) indexed by CID.
-fn get_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u16>> {
-    get_cid_to_gid_map_with_limit(cid_font_dict, doc, None)
-        .expect("unbounded CIDToGIDMap reads never return a size error")
-}
-
 fn get_cid_to_gid_map_with_limit(
     cid_font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -928,16 +906,6 @@ fn build_cmap_with_cid_to_gid_map(
 /// Some PDF generators subset-embed fonts by renumbering GIDs sequentially (1, 2, 3...)
 /// but fail to update the ToUnicode CMap, which still references original GID values.
 /// This detects the mismatch and remaps the CMap to sequential positions.
-fn try_remap_subset_cmap(
-    cmap: ToUnicodeCMap,
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-    obj_num: u32,
-) -> (ToUnicodeCMap, Option<ToUnicodeCMap>) {
-    try_remap_subset_cmap_with_limit(cmap, font_dict, doc, obj_num, None)
-        .expect("unbounded CMap remapping never returns a size error")
-}
-
 fn try_remap_subset_cmap_with_limit(
     cmap: ToUnicodeCMap,
     font_dict: &lopdf::Dictionary,
@@ -976,13 +944,16 @@ fn try_remap_subset_cmap_with_limit(
     // Only bail out when the descendant is *explicitly* something other than
     // CIDFontType2: a missing or unresolvable /Subtype keeps the previous
     // behaviour rather than silently disabling the repair.
-    let subtype = cid_font_dict.get(b"Subtype").ok().and_then(|object| match object {
-        Object::Reference(reference) => doc
-            .get_object(*reference)
-            .ok()
-            .and_then(|object| object.as_name().ok()),
-        object => object.as_name().ok(),
-    });
+    let subtype = cid_font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|object| match object {
+            Object::Reference(reference) => doc
+                .get_object(*reference)
+                .ok()
+                .and_then(|object| object.as_name().ok()),
+            object => object.as_name().ok(),
+        });
     if subtype.is_some_and(|name| name != b"CIDFontType2") {
         debug!("Subset remap skipped for obj={obj_num}: descendant is not CIDFontType2");
         return Ok((cmap, None));
@@ -1696,14 +1667,6 @@ struct EncodingCMap {
     is_identity: bool,
 }
 
-fn build_fallback_tounicode_from_encoding(
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-) -> Option<ToUnicodeCMap> {
-    build_fallback_tounicode_from_encoding_with_limit(font_dict, doc, None)
-        .expect("unbounded encoding CMap reads never return a size error")
-}
-
 fn build_fallback_tounicode_from_encoding_with_limit(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -1737,14 +1700,6 @@ fn build_fallback_tounicode_from_encoding_with_limit(
     }
     cmap.code_byte_length = encoding.code_byte_length;
     Ok(Some(cmap))
-}
-
-pub(crate) fn build_cmap_entry_from_encoding_fallback(
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-) -> Option<CMapEntry> {
-    build_cmap_entry_from_encoding_fallback_with_limit(font_dict, doc, None)
-        .expect("unbounded encoding CMap reads never return a size error")
 }
 
 pub(crate) fn build_cmap_entry_from_encoding_fallback_with_limit(
@@ -1811,14 +1766,6 @@ fn get_cid_system_info_ordering(font_dict: &lopdf::Dictionary, doc: &Document) -
     Some(ordering)
 }
 
-fn build_encoding_cmap_from_font(
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-) -> Option<EncodingCMap> {
-    build_encoding_cmap_from_font_with_limit(font_dict, doc, None)
-        .expect("unbounded encoding CMap reads never return a size error")
-}
-
 fn build_encoding_cmap_from_font_with_limit(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -1841,26 +1788,17 @@ fn build_encoding_cmap_from_font_with_limit(
             Ok(load_builtin_encoding_cmap(&encoding_name))
         }
         Object::Reference(reference) => match doc.get_object(*reference) {
-            Ok(object) => {
-                parse_encoding_cmap_object_with_limit(object, doc, max_decompressed_size)
-            }
+            Ok(object) => parse_encoding_cmap_object_with_limit(object, doc, max_decompressed_size),
             Err(_) => Ok(None),
         },
-        Object::Stream(stream) => Ok(
-            crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
-                .and_then(|data| parse_encoding_cmap_stream(&data)),
-        ),
+        Object::Stream(stream) => Ok(crate::decompressed_stream_content_or_none(
+            stream,
+            max_decompressed_size,
+        )?
+        .and_then(|data| parse_encoding_cmap_stream(&data))),
         Object::Dictionary(_) => Ok(None),
         _ => Ok(None),
     }
-}
-
-fn parse_encoding_cmap_object(
-    object: &Object,
-    doc: &Document,
-) -> Option<EncodingCMap> {
-    parse_encoding_cmap_object_with_limit(object, doc, None)
-        .expect("unbounded encoding CMap reads never return a size error")
 }
 
 fn parse_encoding_cmap_object_with_limit(
@@ -1869,14 +1807,13 @@ fn parse_encoding_cmap_object_with_limit(
     max_decompressed_size: Option<usize>,
 ) -> lopdf::Result<Option<EncodingCMap>> {
     match object {
-        Object::Stream(stream) => Ok(
-            crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
-                .and_then(|data| parse_encoding_cmap_stream(&data)),
-        ),
+        Object::Stream(stream) => Ok(crate::decompressed_stream_content_or_none(
+            stream,
+            max_decompressed_size,
+        )?
+        .and_then(|data| parse_encoding_cmap_stream(&data))),
         Object::Reference(reference) => match doc.get_object(*reference) {
-            Ok(object) => {
-                parse_encoding_cmap_object_with_limit(object, doc, max_decompressed_size)
-            }
+            Ok(object) => parse_encoding_cmap_object_with_limit(object, doc, max_decompressed_size),
             Err(_) => Ok(None),
         },
         _ => Ok(None),
@@ -2587,13 +2524,7 @@ impl FontCMaps {
         by_obj_num: &mut HashMap<u32, CMapEntry>,
         max_decompressed_size: Option<usize>,
     ) -> lopdf::Result<()> {
-        Self::collect_cmaps_from_fonts_inner(
-            fonts,
-            doc,
-            by_obj_num,
-            false,
-            max_decompressed_size,
-        )
+        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false, max_decompressed_size)
     }
 
     fn collect_cmaps_from_fonts_inner(
@@ -2621,8 +2552,7 @@ impl FontCMaps {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let data =
-                crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
+            let data = crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
             if let Some(cmap) = ToUnicodeCMap::parse(&data) {
                 debug!(
                     "CMap obj={:<6} code_byte_length={} char_map={} ranges={}",
@@ -2640,8 +2570,8 @@ impl FontCMaps {
                 )?;
 
                 // Only build expensive fallbacks when the primary CMap is sparse.
-                // build_fallback_cmap_for_type0 can take seconds on large embedded
-                // TrueType fonts (decompressing + parsing 100K+ byte font files).
+                // build_fallback_cmap_for_type0_with_limit can take seconds on
+                // large embedded TrueType fonts (decompressing + parsing 100K+ bytes).
                 // Skip entirely when the primary CMap is sufficient.
                 let primary_entries = primary.char_map.len() + primary.ranges.len();
                 let mut fallback = if primary_entries < 10 && !skip_truetype_fallback {
@@ -2717,11 +2647,7 @@ impl FontCMaps {
                         max_decompressed_size,
                     )?
                 } else if let Some(cmap) =
-                    build_fallback_cmap_for_type0_with_limit(
-                        font_dict,
-                        doc,
-                        max_decompressed_size,
-                    )?
+                    build_fallback_cmap_for_type0_with_limit(font_dict, doc, max_decompressed_size)?
                 {
                     Some(cmap)
                 } else {
@@ -2838,7 +2764,6 @@ impl FontCMaps {
             if lookup_key == 0 || by_obj_num.contains_key(&lookup_key) {
                 continue;
             }
-
 
             // Try parsing embedded TrueType/OpenType cmap
             if let Some(ff_ref) = font_file_ref {
@@ -3082,12 +3007,7 @@ impl FontCMaps {
                             fonts.insert(name.clone(), font);
                         }
                     }
-                    Self::collect_cmaps_from_fonts(
-                        &fonts,
-                        doc,
-                        by_obj_num,
-                        max_decompressed_size,
-                    )?;
+                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num, max_decompressed_size)?;
                 }
                 // Recurse into nested XObjects
                 Self::walk_xobject_fonts(
@@ -3110,14 +3030,6 @@ impl FontCMaps {
 
 /// For Type0 CID fonts, try to build a fallback CMap from embedded font data
 /// or CIDSystemInfo when a ToUnicode CMap is present but incomplete.
-fn build_fallback_cmap_for_type0(
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-) -> Option<ToUnicodeCMap> {
-    build_fallback_cmap_for_type0_with_limit(font_dict, doc, None)
-        .expect("unbounded Type0 CMap reads never return a size error")
-}
-
 fn build_fallback_cmap_for_type0_with_limit(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -3167,14 +3079,15 @@ fn build_fallback_cmap_for_type0_with_limit(
         _ => return Ok(None),
     };
 
-    let font_descriptor = cid_font_dict
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|object| match object {
-            Object::Reference(reference) => doc.get_dictionary(*reference).ok(),
-            Object::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        });
+    let font_descriptor =
+        cid_font_dict
+            .get(b"FontDescriptor")
+            .ok()
+            .and_then(|object| match object {
+                Object::Reference(reference) => doc.get_dictionary(*reference).ok(),
+                Object::Dictionary(dictionary) => Some(dictionary),
+                _ => None,
+            });
 
     let font_file_ref = font_descriptor.and_then(|descriptor| {
         descriptor
@@ -3195,13 +3108,10 @@ fn build_fallback_cmap_for_type0_with_limit(
                 crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
             {
                 if let Some(cmap) = build_cmap_from_truetype(&data) {
-                    if let Some(cid_to_gid) = get_cid_to_gid_map_with_limit(
-                        cid_font_dict,
-                        doc,
-                        max_decompressed_size,
-                    )? {
-                        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid)
-                        {
+                    if let Some(cid_to_gid) =
+                        get_cid_to_gid_map_with_limit(cid_font_dict, doc, max_decompressed_size)?
+                    {
+                        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
                             debug!(
                                 "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
                                 repaired.char_map.len()
@@ -3230,14 +3140,6 @@ fn build_fallback_cmap_for_type0_with_limit(
     Ok(None)
 }
 
-fn build_fallback_cmap_for_simple(
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-) -> Option<ToUnicodeCMap> {
-    build_fallback_cmap_for_simple_with_limit(font_dict, doc, None)
-        .expect("unbounded simple CMap reads never return a size error")
-}
-
 fn build_fallback_cmap_for_simple_with_limit(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
@@ -3253,14 +3155,15 @@ fn build_fallback_cmap_for_simple_with_limit(
     if subtype == b"Type0" {
         return Ok(None);
     }
-    let Some(font_descriptor) = font_dict
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|object| match object {
-            Object::Reference(reference) => doc.get_dictionary(*reference).ok(),
-            Object::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        })
+    let Some(font_descriptor) =
+        font_dict
+            .get(b"FontDescriptor")
+            .ok()
+            .and_then(|object| match object {
+                Object::Reference(reference) => doc.get_dictionary(*reference).ok(),
+                Object::Dictionary(dictionary) => Some(dictionary),
+                _ => None,
+            })
     else {
         return Ok(None);
     };
@@ -3280,8 +3183,7 @@ fn build_fallback_cmap_for_simple_with_limit(
     let Ok(stream) = doc.get_object(font_file_ref).and_then(Object::as_stream) else {
         return Ok(None);
     };
-    let Some(data) =
-        crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
+    let Some(data) = crate::decompressed_stream_content_or_none(stream, max_decompressed_size)?
     else {
         return Ok(None);
     };
@@ -3298,26 +3200,26 @@ fn build_fallback_cmap_for_simple_with_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::dictionary;
 
     #[cfg(feature = "builtin_cmaps")]
     #[test]
     fn builtin_cmap_decodes_unigb_ucs2_without_tounicode() {
         let doc = Document::new();
-        let font_dict = lopdf::dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type0",
-            "Encoding" => "UniGB-UCS2-H",
-            "DescendantFonts" => vec![Object::Dictionary(lopdf::dictionary! {
-                "Type" => "Font",
-                "Subtype" => "CIDFontType0",
-                "CIDSystemInfo" => lopdf::dictionary! {
-                    "Registry" => Object::string_literal("Adobe"),
-                    "Ordering" => Object::string_literal("GB1"),
-                    "Supplement" => 0,
-                },
-            })],
-        };
+        let mut cid_system_info = lopdf::Dictionary::new();
+        cid_system_info.set("Registry", Object::string_literal("Adobe"));
+        cid_system_info.set("Ordering", Object::string_literal("GB1"));
+        cid_system_info.set("Supplement", 0);
+
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Type", "Font");
+        cid_font.set("Subtype", "CIDFontType0");
+        cid_font.set("CIDSystemInfo", cid_system_info);
+
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Type", "Font");
+        font_dict.set("Subtype", "Type0");
+        font_dict.set("Encoding", "UniGB-UCS2-H");
+        font_dict.set("DescendantFonts", vec![Object::Dictionary(cid_font)]);
 
         let data =
             read_builtin_cmap_file("UniGB-UCS2-H.bcmap").expect("UniGB-UCS2-H must be embedded");
@@ -3332,7 +3234,8 @@ mod tests {
             .expect("Adobe-GB1-UCS2 must load from embedded CMaps");
         assert_eq!(ucs2.lookup(cid).as_deref(), Some("中"));
 
-        let entry = build_cmap_entry_from_encoding_fallback(&font_dict, &doc)
+        let entry = build_cmap_entry_from_encoding_fallback_with_limit(&font_dict, &doc, None)
+            .expect("unbounded encoding CMap reads never return a size error")
             .expect("UniGB-UCS2-H must resolve through embedded CMaps");
         assert_eq!(entry.primary.lookup(0x4E2D).as_deref(), Some("中"));
     }
@@ -3722,7 +3625,7 @@ endbfchar
         let mut remapped: Option<ToUnicodeCMap> = Some(sequential_remap);
         let mut fallback: Option<ToUnicodeCMap> = Some(truetype_fb);
 
-        // Apply the same promotion logic as build_cmap_entry_from_stream
+        // Apply the same promotion logic as stream CMap construction.
         if remapped.is_some() {
             if let Some(ref fb) = fallback {
                 let fb_entries = fb.char_map.len() + fb.ranges.len();
@@ -3932,7 +3835,9 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 123);
+        let (primary, remapped) =
+            try_remap_subset_cmap_with_limit(cmap, &font_dict, &doc, 123, None)
+                .expect("unbounded CMap remapping never returns a size error");
         assert!(
             remapped.is_none(),
             "Remap must be skipped when W covers CMap max CID (this is 16.pdf)"
@@ -3972,7 +3877,9 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 456);
+        let (_primary, remapped) =
+            try_remap_subset_cmap_with_limit(cmap, &font_dict, &doc, 456, None)
+                .expect("unbounded CMap remapping never returns a size error");
         assert!(
             remapped.is_some(),
             "Remap must fire when CMap's CIDs are outside W array coverage"
@@ -4027,7 +3934,9 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 789);
+        let (primary, remapped) =
+            try_remap_subset_cmap_with_limit(cmap, &font_dict, &doc, 789, None)
+                .expect("unbounded CMap remapping never returns a size error");
         assert!(
             remapped.is_none(),
             "Remap must be skipped for CIDFontType0 (CFF) descendants, including a \
@@ -4074,7 +3983,9 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 790);
+        let (_primary, remapped) =
+            try_remap_subset_cmap_with_limit(cmap, &font_dict, &doc, 790, None)
+                .expect("unbounded CMap remapping never returns a size error");
         assert!(
             remapped.is_some(),
             "An indirect /Subtype naming CIDFontType2 must still reach the remap"

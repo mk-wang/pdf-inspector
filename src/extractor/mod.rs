@@ -21,7 +21,7 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items_with_limit;
+use content_stream::{extract_page_text_items_with_context, PageTextExtractionContext};
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -165,17 +165,6 @@ pub(crate) fn extract_positioned_text_from_doc(
     extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None, None)
 }
 
-/// Extract selected pages and gather document-wide folio evidence only when a
-/// selected page contains an ambiguous contextual page-edge number. Errors on
-/// selected pages remain fatal; errors on context-only pages are skipped.
-pub(crate) fn extract_positioned_text_with_folio_context(
-    doc: &Document,
-    font_cmaps: &FontCMaps,
-    page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_with_folio_context_with_limit(doc, font_cmaps, page_filter, None)
-}
-
 pub(crate) fn extract_positioned_text_with_folio_context_with_limit(
     doc: &Document,
     font_cmaps: &FontCMaps,
@@ -188,20 +177,6 @@ pub(crate) fn extract_positioned_text_with_folio_context_with_limit(
         page_filter,
         false,
         max_decompressed_size,
-    )
-}
-
-/// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
-pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
-    doc: &Document,
-    font_cmaps: &FontCMaps,
-    page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_include_invisible_with_folio_context_with_limit(
-        doc,
-        font_cmaps,
-        page_filter,
-        None,
     )
 }
 
@@ -323,15 +298,18 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let page_result = extract_page_text_items_with_limit(
+        let mut form_budget = FormWalkBudget::new();
+        let page_result = extract_page_text_items_with_context(
             doc,
             page_id,
             *page_num,
             font_cmaps,
-            include_invisible,
-            &mut style_cache,
-            &mut FormWalkBudget::new(),
-            max_decompressed_size,
+            PageTextExtractionContext::new(
+                include_invisible,
+                &mut style_cache,
+                &mut form_budget,
+                max_decompressed_size,
+            ),
         );
         let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
             match page_result {
@@ -1386,11 +1364,11 @@ mod tests {
         // break): the split must land between the modes. Needs >=4 gaps to
         // enter the bimodal tier — short runs use the strict uniform gate.
         let mut items = glyph_run("ITISOK", 100.0, 8.0, 2.3);
-        for i in 2..6 {
-            items[i].x += 2.8; // word gap at T|I
+        for item in items.iter_mut().skip(2).take(4) {
+            item.x += 2.8; // word gap at T|I
         }
-        for i in 4..6 {
-            items[i].x += 2.8; // word gap at S|O
+        for item in items.iter_mut().skip(4).take(2) {
+            item.x += 2.8; // word gap at S|O
         }
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);

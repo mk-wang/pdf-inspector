@@ -153,28 +153,51 @@ pub(crate) fn extract_page_text_items(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
-    extract_page_text_items_with_limit(
+    extract_page_text_items_with_context(
         doc,
         page_id,
         page_num,
         font_cmaps,
-        include_invisible,
-        style_cache,
-        form_budget,
-        None,
+        PageTextExtractionContext::new(include_invisible, style_cache, form_budget, None),
     )
 }
 
-pub(crate) fn extract_page_text_items_with_limit(
+pub(super) struct PageTextExtractionContext<'a> {
+    include_invisible: bool,
+    style_cache: &'a mut FontStyleCache,
+    form_budget: &'a mut FormWalkBudget,
+    max_decompressed_size: Option<usize>,
+}
+
+impl<'a> PageTextExtractionContext<'a> {
+    pub(super) fn new(
+        include_invisible: bool,
+        style_cache: &'a mut FontStyleCache,
+        form_budget: &'a mut FormWalkBudget,
+        max_decompressed_size: Option<usize>,
+    ) -> Self {
+        Self {
+            include_invisible,
+            style_cache,
+            form_budget,
+            max_decompressed_size,
+        }
+    }
+}
+
+pub(super) fn extract_page_text_items_with_context(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
-    include_invisible: bool,
-    style_cache: &mut FontStyleCache,
-    form_budget: &mut FormWalkBudget,
-    max_decompressed_size: Option<usize>,
+    context: PageTextExtractionContext<'_>,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
+    let PageTextExtractionContext {
+        include_invisible,
+        style_cache,
+        form_budget,
+        max_decompressed_size,
+    } = context;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
@@ -235,8 +258,7 @@ pub(crate) fn extract_page_text_items_with_limit(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data =
-                        crate::decompressed_stream_content_or_raw(s, max_decompressed_size)?;
+                    let data = crate::decompressed_stream_content_or_raw(s, max_decompressed_size)?;
                     if let Some(entry) = crate::tounicode::build_cmap_entry_from_stream_with_limit(
                         &data,
                         font_dict,
@@ -361,6 +383,7 @@ pub(crate) fn extract_page_text_items_with_limit(
     struct MarkedContentEntry {
         actual_text: Option<String>,
         mcid: Option<i64>,
+        is_artifact: bool,
     }
     let mut marked_content_stack: Vec<MarkedContentEntry> = Vec::new();
     let mut suppress_glyph_extraction = false;
@@ -373,6 +396,10 @@ pub(crate) fn extract_page_text_items_with_limit(
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
         stack.iter().rev().find_map(|e| e.mcid)
+    }
+
+    fn in_artifact(stack: &[MarkedContentEntry]) -> bool {
+        stack.iter().any(|entry| entry.is_artifact)
     }
 
     for op in &content.operations {
@@ -545,6 +572,13 @@ pub(crate) fn extract_page_text_items_with_limit(
                         }
                         continue;
                     }
+                    if in_artifact(&marked_content_stack) {
+                        if let Some(w_ts) = w_ts_opt {
+                            text_matrix[4] += w_ts * text_matrix[0];
+                            text_matrix[5] += w_ts * text_matrix[1];
+                        }
+                        continue;
+                    }
                     // Skip invisible (Tr=3) text but still advance text matrix.
                     // For Mixed/template PDFs, include_invisible=true extracts
                     // the OCR text layer that sits behind scanned images.
@@ -639,7 +673,8 @@ pub(crate) fn extract_page_text_items_with_limit(
                             skipped_invisible = true;
                         }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
-                            || suppress_glyph_extraction;
+                            || suppress_glyph_extraction
+                            || in_artifact(&marked_content_stack);
                         // Capture first-glyph position for ActualText
                         if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
                             actual_text_glyph_tm = Some(text_matrix);
@@ -855,6 +890,7 @@ pub(crate) fn extract_page_text_items_with_limit(
                 }
                 if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
+                    || in_artifact(&marked_content_stack)
                     || op.operands.is_empty())
                 {
                     if let Some(text) = extract_text_from_operand(
@@ -976,16 +1012,27 @@ pub(crate) fn extract_page_text_items_with_limit(
                 }
             }
             "BMC" => {
-                // Begin Marked Content (no properties)
+                // Begin Marked Content (no properties).
+                let is_artifact = op
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .is_some_and(|name| name == b"Artifact");
                 marked_content_stack.push(MarkedContentEntry {
                     actual_text: None,
                     mcid: None,
+                    is_artifact,
                 });
             }
             "BDC" => {
                 // Begin Marked Content with properties — extract ActualText and MCID
                 let mut actual_text: Option<String> = None;
                 let mut mcid: Option<i64> = None;
+                let is_artifact = op
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .is_some_and(|name| name == b"Artifact");
                 if op.operands.len() >= 2 {
                     let dict = match &op.operands[1] {
                         Object::Dictionary(d) => Some(d.clone()),
@@ -1011,12 +1058,25 @@ pub(crate) fn extract_page_text_items_with_limit(
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
                 }
-                marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
+                marked_content_stack.push(MarkedContentEntry {
+                    actual_text,
+                    mcid,
+                    is_artifact,
+                });
             }
             "EMC" => {
+                let omit_actual_text = in_artifact(&marked_content_stack);
                 // End Marked Content — emit ActualText item with correct width
                 if let Some(entry) = marked_content_stack.pop() {
                     if let Some(at) = entry.actual_text {
+                        if omit_actual_text {
+                            actual_text_glyph_tm = None;
+                            actual_text_glyph_rise = None;
+                            actual_text_start_tm = None;
+                            suppress_glyph_extraction =
+                                marked_content_stack.iter().any(|e| e.actual_text.is_some());
+                            continue;
+                        }
                         // Use the first-glyph position (if available) instead of the
                         // BDC-entry position. Td operators between BDC and the first
                         // Tj may have moved the text position to the correct line —
@@ -1740,6 +1800,25 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
         assert!((raised.y - 505.0).abs() < 0.1);
         assert!((after.y - 500.0).abs() < 0.1);
         assert!(after.x > raised.x);
+    }
+
+    #[test]
+    fn suppresses_artifact_marked_content_but_preserves_text_advance() {
+        let items = extract_simple_items(
+            b"BT /F1 12 Tf 1 0 0 1 100 500 Tm \
+              /Artifact BMC [(hidden)] TJ EMC \
+              /Artifact << /Type /Pagination >> BDC (also hidden) Tj EMC \
+              (visible) Tj ET",
+        );
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["visible"]
+        );
+        assert!(items[0].x > 100.0);
     }
 
     #[test]

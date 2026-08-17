@@ -57,8 +57,9 @@ pub struct PdfTypeResult {
     /// Whether OCR is recommended for better extraction
     /// True when images provide essential context (e.g., template-based PDFs)
     pub ocr_recommended: bool,
-    /// 1-indexed page numbers that need OCR (image-only or insufficient text).
-    /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
+    /// 1-indexed page numbers that need OCR (image-only, insufficient text,
+    /// or undecodable source fonts). Empty for normal TextBased PDFs; all
+    /// pages for Scanned/ImageBased; specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
     /// Per-page explanation for `pages_needing_ocr`: 1-indexed page → reason
     /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`).
@@ -229,8 +230,7 @@ pub(crate) fn detect_from_document_with_limit(
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
-            let analysis =
-                analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
+            let analysis = analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -399,8 +399,7 @@ pub(crate) fn detect_from_document_with_limit(
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a =
-                        analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
+                    let a = analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -744,6 +743,7 @@ fn resolve_with_shadowing(
 }
 
 /// Analyze a page's content stream for text operators and images
+#[cfg(test)]
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     analyze_page_content_with_limit(doc, page_id, None)
         .expect("unbounded detector recovery never returns a size error")
@@ -779,8 +779,7 @@ fn analyze_page_content_with_limit(
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content =
-                crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
+            let content = crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
@@ -895,12 +894,7 @@ fn analyze_page_content_with_limit(
     // bytes but are fully decodable — we need this to avoid false scan detection.
     // Only considers fonts actually USED via Tf operators (P1 + P2 fix).
     let has_decodable_text_fonts = text_ops > 0
-        && used_fonts_have_decodable_text(
-            &used_font_ids,
-            &font_map,
-            doc,
-            max_decompressed_size,
-        )?;
+        && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc, max_decompressed_size)?;
 
     Ok(PageAnalysis {
         text_operator_count: text_ops,
@@ -982,8 +976,7 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
                 has_undecodable_identity_h = true;
             }
             Some(b"Type3") => {
-                // Type3 fonts are handled separately by page_has_only_type3_fonts;
-                // don't count them as decodable here.
+                // Type3 fonts are not counted as decodable here.
             }
             _ => {
                 // Type1, TrueType, MMType1, CIDFontType0/2 — these are generally
@@ -1001,6 +994,7 @@ fn page_has_identity_h_no_tounicode(doc: &Document, page_id: ObjectId) -> bool {
 
 /// Check whether an Identity-H font without ToUnicode can still be decoded
 /// via one of the extraction pipeline's fallback paths.
+#[cfg(test)]
 fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
     identity_h_font_has_fallback_with_limit(font_dict, doc, None).unwrap_or(false)
 }
@@ -1070,12 +1064,6 @@ fn identity_h_font_has_fallback_with_limit(
     Ok(false)
 }
 
-/// Quick check whether an embedded TrueType/OpenType font has a cmap table
-/// that can map GIDs to Unicode codepoints.
-fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
-    embedded_font_has_cmap_with_limit(doc, font_ref, None).unwrap_or(false)
-}
-
 fn embedded_font_has_cmap_with_limit(
     doc: &Document,
     font_ref: lopdf::ObjectId,
@@ -1087,9 +1075,9 @@ fn embedded_font_has_cmap_with_limit(
     };
     let data = match crate::decompressed_stream_content(stream, max_decompressed_size) {
         Ok(data) => data,
-        Err(error @ lopdf::Error::Decompress(
-            lopdf::DecompressError::MemoryLimitExceeded { .. },
-        )) => return Err(error.into()),
+        Err(
+            error @ lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. }),
+        ) => return Err(error.into()),
         Err(_) => return Ok(false),
     };
     let face = match ttf_parser::Face::parse(&data, 0) {
@@ -1112,44 +1100,6 @@ fn embedded_font_has_cmap_with_limit(
         }
     }
     Ok(false)
-}
-
-/// Returns true if every font on the page is Type3 (no normal text fonts).
-/// Type3 fonts render glyphs as custom drawings/bitmaps. Without a ToUnicode
-/// CMap, character codes can't be mapped to Unicode — the page needs OCR.
-///
-/// NOTE: Resource-based check. Superseded by `used_fonts_are_only_type3`.
-/// Kept for existing unit tests.
-#[cfg(test)]
-fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
-    let fonts = match doc.get_page_fonts(page_id) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    if fonts.is_empty() {
-        return false;
-    }
-    let mut has_type3 = false;
-    for font_dict in fonts.values() {
-        let subtype = font_dict
-            .get(b"Subtype")
-            .ok()
-            .and_then(|o| o.as_name().ok());
-        if subtype == Some(b"Type3") {
-            // Type3 with a ToUnicode CMap can still produce usable text
-            if font_dict.get(b"ToUnicode").is_ok() {
-                return false;
-            }
-            has_type3 = true;
-        } else {
-            // Has a non-Type3 font — page has real text fonts
-            return false;
-        }
-    }
-    if has_type3 {
-        log::debug!("page has only Type3 fonts without ToUnicode — text is undecodable");
-    }
-    has_type3
 }
 
 /// Check if the page has at least one font that can produce decodable Unicode text.
@@ -1231,11 +1181,8 @@ fn used_fonts_have_identity_h_no_tounicode(
                     has_other_decodable_font = true;
                     continue;
                 }
-                if identity_h_font_has_fallback_with_limit(
-                    &info.dict,
-                    doc,
-                    max_decompressed_size,
-                )? {
+                if identity_h_font_has_fallback_with_limit(&info.dict, doc, max_decompressed_size)?
+                {
                     has_other_decodable_font = true;
                     continue;
                 }
@@ -1256,8 +1203,8 @@ fn used_fonts_have_identity_h_no_tounicode(
 
 /// Usage-based check: are ALL used fonts Type3 without ToUnicode?
 ///
-/// Unlike `page_has_only_type3_fonts`, this only considers fonts actually referenced
-/// by Tf operators (P1 fix) and includes Form XObject fonts (P2 fix).
+/// It only considers fonts actually referenced by Tf operators (P1 fix) and
+/// includes Form XObject fonts (P2 fix).
 fn used_fonts_are_only_type3(
     used_font_ids: &HashSet<ObjectId>,
     font_map: &HashMap<ObjectId, FontInfo>,
@@ -1305,11 +1252,8 @@ fn used_fonts_have_decodable_text(
                 return Ok(true);
             }
             Some(b"Type0") => {
-                if identity_h_font_has_fallback_with_limit(
-                    &info.dict,
-                    doc,
-                    max_decompressed_size,
-                )? {
+                if identity_h_font_has_fallback_with_limit(&info.dict, doc, max_decompressed_size)?
+                {
                     return Ok(true);
                 }
             }
@@ -1874,11 +1818,25 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 /// these pages to OCR, independent of any template-image check, since
 /// outlined glyphs can't be extracted as text at all.
 ///
+/// `has_unmapped_font` is true when the page uses Identity-H/Identity-V or
+/// Type3 text without a usable Unicode mapping. Those pages need OCR even
+/// when the decoded text is non-empty, because the glyph values are not
+/// reliable Unicode.
+///
 /// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
 /// the same gates classification needs elsewhere instead of treating the
 /// raw signals alone as sufficient — see #227/#231.
-pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
-    let analysis = analyze_page_content(doc, page_id);
+pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool, bool) {
+    page_ocr_signals_with_limit(doc, page_id, None)
+        .expect("unbounded page OCR signal analysis never returns a size error")
+}
+
+pub(crate) fn page_ocr_signals_with_limit(
+    doc: &Document,
+    page_id: ObjectId,
+    max_decompressed_size: Option<usize>,
+) -> Result<(bool, bool, bool), PdfError> {
+    let analysis = analyze_page_content_with_limit(doc, page_id, max_decompressed_size)?;
 
     let needs_ocr_for_template_image = if !analysis.has_template_image {
         false
@@ -1892,7 +1850,11 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
         looks_like_scan || insufficient_text
     };
 
-    (needs_ocr_for_template_image, analysis.has_vector_text)
+    Ok((
+        needs_ocr_for_template_image,
+        analysis.has_vector_text,
+        analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts,
+    ))
 }
 
 /// Recursively collect image dimensions from XObject resources,
@@ -2530,7 +2492,6 @@ mod tests {
 
         // Normal doc: low text ops — doesn't qualify at all
         let text_ops = 300u32;
-        let font_changes = 50u32;
         assert!(text_ops < 1500);
     }
 
@@ -2924,8 +2885,8 @@ mod tests {
         let mut fonts = HashSet::new();
         let content = b"BT /F1 12 Tf (Hello) Tj /F2 10 Tf (World) Tj ET";
         scan_content_for_text_operators(content, &mut uchars, &mut fonts);
-        assert!(fonts.contains(&b"F1".to_vec()), "should collect F1");
-        assert!(fonts.contains(&b"F2".to_vec()), "should collect F2");
+        assert!(fonts.contains(b"F1".as_slice()), "should collect F1");
+        assert!(fonts.contains(b"F2".as_slice()), "should collect F2");
         assert_eq!(fonts.len(), 2);
     }
 

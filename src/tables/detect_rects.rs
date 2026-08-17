@@ -5223,13 +5223,12 @@ mod tests {
             }
         }
 
-        let mut items: Vec<TextItem> = Vec::new();
-        // Header row (y ≈ 392.5): headers sit further to the right than data
-        // because they are centered/right-aligned in the cells.
-        items.push(make_item("Item", 389.0, 392.5, 9.0));
-        items.push(make_item("EAN", 432.0, 392.5, 9.0));
-        items.push(make_item("Nombre", 552.0, 392.5, 9.0));
-        items.push(make_item("Cant", 672.0, 392.5, 9.0));
+        let mut items = vec![
+            make_item("Item", 389.0, 392.5, 9.0),
+            make_item("EAN", 432.0, 392.5, 9.0),
+            make_item("Nombre", 552.0, 392.5, 9.0),
+            make_item("Cant", 672.0, 392.5, 9.0),
+        ];
 
         let names = [
             "Arnes Frontal",
@@ -5242,11 +5241,11 @@ mod tests {
             "Arnes Lateral",
             "Arnes Sensor",
         ];
-        for r in 0..9 {
+        for (r, name) in names.into_iter().enumerate() {
             let y = 377.5 - 15.0 * r as f32;
             items.push(make_item(&(r + 1).to_string(), 396.0, y, 9.0));
             items.push(make_item("7701023403016", 410.0, y, 9.0));
-            items.push(make_item(names[r], 480.0, y, 9.0));
+            items.push(make_item(name, 480.0, y, 9.0));
             items.push(make_item("1", 680.0, y, 9.0));
         }
 

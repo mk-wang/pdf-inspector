@@ -982,6 +982,7 @@ impl FontStyleCache {
 /// Italic: `ItalicAngle` beyond a few degrees, or Flags bit 7 (Italic,
 /// value 64). Bold: Flags bit 19 (ForceBold, value 1<<18). The small
 /// ItalicAngle threshold skips fonts that declare a token slant.
+#[cfg(test)]
 pub(crate) fn descriptor_style_flags(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
@@ -1135,10 +1136,7 @@ fn font_file_data_with_limit(
     ff_ref: ObjectId,
     max_decompressed_size: Option<usize>,
 ) -> lopdf::Result<Option<Vec<u8>>> {
-    let stream = match doc
-        .get_object(ff_ref)
-        .and_then(lopdf::Object::as_stream)
-    {
+    let stream = match doc.get_object(ff_ref).and_then(lopdf::Object::as_stream) {
         Ok(stream) => stream,
         Err(_) => return Ok(None),
     };

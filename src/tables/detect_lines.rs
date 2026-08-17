@@ -2797,7 +2797,7 @@ mod tests {
 
     #[test]
     fn test_dense_row_hypothesis_requires_numeric_body_evidence() {
-        let lines = vec![
+        let lines = [
             make_hline(520.0, 80.0, 520.0, 1),
             make_hline(490.0, 80.0, 520.0, 1),
             make_hline(460.0, 80.0, 520.0, 1),
@@ -2878,7 +2878,7 @@ mod tests {
 
     #[test]
     fn test_fragmented_row_counts_distinct_anchor_columns() {
-        let items = vec![
+        let items = [
             make_item("left", 100.0, 500.0, 1),
             make_item("fragment", 133.0, 500.0, 1),
             make_item("right", 300.0, 500.0, 1),
