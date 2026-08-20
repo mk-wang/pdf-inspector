@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use lopdf::Document;
 use thiserror::Error;
 
-use crate::detector::{self, PdfType};
+use crate::detector::{self, PdfType, ScanStrategy};
 use crate::markdown::MarkdownOptions;
 use crate::process_mode::ProcessMode;
 use crate::structure_tree::{StructRole, StructTable};
@@ -296,6 +296,7 @@ pub fn prepare_hybrid_markdown(
     mut options: PdfOptions,
 ) -> Result<HybridMarkdownSession, HybridMarkdownError> {
     options.mode = ProcessMode::Full;
+    options.detection.strategy = ScanStrategy::Full;
     let page_count = document.get_pages().len() as u32;
     let prepared = prepare_markdown_state(document, page_count, options)?;
     Ok(HybridMarkdownSession::from_prepared(prepared))
@@ -936,6 +937,139 @@ mod tests {
         );
         document.trailer.set("Root", catalog_id);
         document
+    }
+    fn mixed_twenty_page_document() -> Document {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.new_object_id();
+        document.objects.insert(
+            font_id,
+            dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+            }
+            .into(),
+        );
+        let image_id = document.new_object_id();
+        document.objects.insert(
+            image_id,
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 1,
+                    "Height" => 1,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                vec![0],
+            )
+            .into(),
+        );
+
+        let mut kids = Vec::new();
+        for page_number in 1..=20u32 {
+            let page_id = document.new_object_id();
+            let content_id = document.new_object_id();
+            let (resources, content) = if page_number % 2 == 1 || page_number == 20 {
+                let content = Content {
+                    operations: vec![
+                        lopdf::content::Operation::new("BT", vec![]),
+                        lopdf::content::Operation::new(
+                            "Tf",
+                            vec![Object::Name(b"F1".to_vec()), 12.into()],
+                        ),
+                        lopdf::content::Operation::new("Td", vec![72.into(), 700.into()]),
+                        lopdf::content::Operation::new(
+                            "Tj",
+                            vec![Object::string_literal(format!("Native page {page_number}"))],
+                        ),
+                        lopdf::content::Operation::new(
+                            "Td",
+                            vec![Object::Integer(0), Object::Integer(-18)],
+                        ),
+                        lopdf::content::Operation::new(
+                            "Tj",
+                            vec![Object::string_literal("native body text")],
+                        ),
+                        lopdf::content::Operation::new(
+                            "Td",
+                            vec![Object::Integer(0), Object::Integer(-18)],
+                        ),
+                        lopdf::content::Operation::new(
+                            "Tj",
+                            vec![Object::string_literal("native footer text")],
+                        ),
+                        lopdf::content::Operation::new("ET", vec![]),
+                    ],
+                };
+                (
+                    dictionary! { "Font" => dictionary! { "F1" => font_id } },
+                    content,
+                )
+            } else {
+                let content = Content {
+                    operations: vec![
+                        lopdf::content::Operation::new("q", vec![]),
+                        lopdf::content::Operation::new(
+                            "cm",
+                            vec![612.into(), 0.into(), 0.into(), 792.into(), 0.into(), 0.into()],
+                        ),
+                        lopdf::content::Operation::new("Do", vec![Object::Name(b"Im1".to_vec())]),
+                        lopdf::content::Operation::new("Q", vec![]),
+                    ],
+                };
+                (
+                    dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+                    content,
+                )
+            };
+            document.objects.insert(
+                content_id,
+                Stream::new(dictionary! {}, content.encode().unwrap()).into(),
+            );
+            document.objects.insert(
+                page_id,
+                dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => resources,
+                    "Contents" => content_id,
+                }
+                .into(),
+            );
+            kids.push(page_id.into());
+        }
+        document.objects.insert(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => 20,
+            }
+            .into(),
+        );
+        let catalog_id = document.new_object_id();
+        document.objects.insert(
+            catalog_id,
+            dictionary! { "Type" => "Catalog", "Pages" => pages_id }.into(),
+        );
+        document.trailer.set("Root", catalog_id);
+        document
+    }
+
+    #[test]
+    fn complete_preparation_scans_every_page_for_ocr_routes() {
+        let document = mixed_twenty_page_document();
+        let session = prepare_hybrid_markdown(&document, PdfOptions::new()).unwrap();
+        let requested: Vec<_> = session
+            .ocr_requests()
+            .into_iter()
+            .map(|request| request.page)
+            .collect();
+        assert_eq!(requested, vec![2, 4, 6, 8, 10, 12, 14, 16, 18]);
     }
 
     #[test]
