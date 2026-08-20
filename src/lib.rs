@@ -35,6 +35,7 @@ pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
+pub mod hybrid_markdown;
 pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
@@ -51,6 +52,11 @@ pub use detector::{
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_mem,
     extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+};
+pub use hybrid_markdown::{
+    prepare_hybrid_markdown, HybridMarkdownDocument, HybridMarkdownError, HybridMarkdownPage,
+    HybridMarkdownPageSource, HybridMarkdownSession, NormalizedRect, OcrPageRequest, OcrPageResult,
+    OcrToken,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -361,7 +367,7 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
         options.max_decompressed_size,
     )?;
 
-    process_document(doc, page_count, options, start)
+    process_document(&doc, page_count, options, start)
 }
 
 /// Process a PDF from a memory buffer with full extraction.
@@ -390,7 +396,21 @@ pub fn process_pdf_mem_with_options(
         options.max_decompressed_size,
     )?;
 
-    process_document(doc, page_count, options, start)
+    process_document(&doc, page_count, options, start)
+}
+
+/// Process an already-loaded PDF document with full detection and extraction.
+///
+/// The caller owns the document and must have validated/loaded it with the same
+/// decompression policy represented by `options`. This avoids reparsing when a
+/// higher-level resource already retains a valid `lopdf::Document`.
+pub fn process_loaded_document_with_options(
+    document: &Document,
+    options: PdfOptions,
+) -> Result<PdfProcessResult, PdfError> {
+    let start = ProcessingTimer::start();
+    let page_count = document.get_pages().len() as u32;
+    process_document(document, page_count, options, start)
 }
 
 // =========================================================================
@@ -3995,376 +4015,12 @@ fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
 
 /// Core processing pipeline operating on a pre-loaded document.
 fn process_document(
-    doc: Document,
+    doc: &Document,
     page_count: u32,
     options: PdfOptions,
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
-    // Step 1 — Detection (cheap: scans content streams for text operators)
-    let detection = detector::detect_from_document_with_limit(
-        &doc,
-        page_count,
-        &options.detection,
-        options.max_decompressed_size,
-    )?;
-    let pdf_type = detection.pdf_type;
-    let pages_needing_ocr = detection.pages_needing_ocr;
-    let title = detection.title;
-    let confidence = detection.confidence;
-    let detection_ocr_reasons = detection.ocr_reasons_by_page;
-
-    // DetectOnly → return immediately
-    if options.mode == ProcessMode::DetectOnly {
-        return Ok(PdfProcessResult {
-            pdf_type,
-            markdown: None,
-            page_count,
-            processing_time_ms: start.elapsed_ms(),
-            pages_needing_ocr,
-            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
-            title,
-            confidence,
-            layout: LayoutComplexity::default(),
-            has_encoding_issues: false,
-        });
-    }
-
-    // Scanned / ImageBased → nothing to extract
-    if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
-        return Ok(PdfProcessResult {
-            pdf_type,
-            markdown: None,
-            page_count,
-            processing_time_ms: start.elapsed_ms(),
-            pages_needing_ocr,
-            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
-            title,
-            confidence,
-            layout: LayoutComplexity::default(),
-            has_encoding_issues: false,
-        });
-    }
-
-    // Step 2 — Extraction (reuses the already-loaded document)
-    let extracted = {
-        let font_cmaps = FontCMaps::from_doc_with_limit(&doc, options.max_decompressed_size)?;
-        // Most page-filtered requests extract only the selected pages. Gather
-        // other pages only when a selected contextual folio needs cross-page
-        // evidence; failures on those context-only pages are non-fatal.
-        let result = extractor::extract_positioned_text_with_folio_context_with_limit(
-            &doc,
-            &font_cmaps,
-            options.page_filter.as_ref(),
-            options.max_decompressed_size,
-        );
-
-        // Mixed/template PDFs may store an OCR text layer as invisible text.
-        // Retry it after empty or garbage visible text, and after ordinary
-        // extraction failures. A decompression-limit breach is the sole
-        // recovery error that must stop processing.
-        if pdf_type == PdfType::Mixed {
-            match result {
-                Ok(((items, _rects, _lines), thresholds, gid_encoded_pages)) => {
-                    let sample: String = items
-                        .iter()
-                        .filter(|item| {
-                            options
-                                .page_filter
-                                .as_ref()
-                                .is_none_or(|filter| filter.contains(&item.page))
-                        })
-                        .take(200)
-                        .map(|item| item.text.as_str())
-                        .collect();
-                    if is_garbage_text(&sample) || sample.trim().is_empty() {
-                        extractor::extract_positioned_text_include_invisible_with_folio_context_with_limit(
-                            &doc,
-                            &font_cmaps,
-                            options.page_filter.as_ref(),
-                            options.max_decompressed_size,
-                        )
-                    } else {
-                        Ok(((items, _rects, _lines), thresholds, gid_encoded_pages))
-                    }
-                }
-                Err(error) if !error.is_decompression_limit() => {
-                    extractor::extract_positioned_text_include_invisible_with_folio_context_with_limit(
-                        &doc,
-                        &font_cmaps,
-                        options.page_filter.as_ref(),
-                        options.max_decompressed_size,
-                    )
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            result
-        }
-    };
-
-    // Mixed documents retain their best-effort text extraction behavior; only
-    // an actual decompression-limit breach becomes a request failure.
-    let extracted = match extracted {
-        Ok(extracted) => Some(extracted),
-        Err(error) if pdf_type == PdfType::Mixed && !error.is_decompression_limit() => None,
-        Err(error) => return Err(error),
-    };
-
-    // Parse structure tree for tagged PDFs (reuses the loaded document)
-    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
-        .map(|tree| {
-            let page_ids = doc.get_pages();
-            let roles = tree.mcid_to_roles(&page_ids);
-            let tables = tree.extract_tables(&page_ids);
-            if !roles.is_empty() {
-                log::debug!(
-                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
-                    roles.len(),
-                    tree.mcid_count(),
-                    tables.len()
-                );
-            }
-            let roles = if roles.is_empty() { None } else { Some(roles) };
-            (roles, tables)
-        })
-        .unwrap_or((None, Vec::new()));
-
-    let (
-        markdown,
-        layout,
-        has_encoding_issues,
-        gid_pages,
-        text_quality_pages,
-        text_quality_reasons_by_page,
-    ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
-            let mut ocr_reasons_by_page = BTreeMap::new();
-
-            // TextBased pages with an Identity-H/Identity-V or Type3 font
-            // without a usable Unicode mapping are OCR candidates even when
-            // an embedded-font fallback happens to produce readable text. The
-            // fallback cannot establish that the source glyph IDs are reliable
-            // Unicode, so do not publish that page's text as Markdown.
-            // Mixed PDFs retain their best-effort text behavior because their
-            // OCR route is driven by template images rather than font mapping.
-            let unmapped_font_pages: HashSet<u32> = if pdf_type == PdfType::TextBased {
-                // Detection already scans every TextBased page for the same
-                // Identity-H/Type3 mapping signals. Reuse its complete page
-                // set rather than decompressing and parsing every content
-                // stream a second time.
-                pages_needing_ocr.iter().copied().collect()
-            } else {
-                HashSet::new()
-            };
-            let (items, rects, lines) = if unmapped_font_pages.is_empty() {
-                (items, rects, lines)
-            } else {
-                let suppressed_pages: HashSet<u32> = unmapped_font_pages
-                    .into_iter()
-                    .filter(|page| {
-                        options
-                            .page_filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.contains(page))
-                    })
-                    .collect();
-                if suppressed_pages.is_empty() {
-                    (items, rects, lines)
-                } else {
-                    log::debug!(
-                        "suppressing unreliable text from OCR-flagged pages: {:?}",
-                        suppressed_pages
-                    );
-                    for page in &suppressed_pages {
-                        add_ocr_reason(
-                            &mut ocr_reasons_by_page,
-                            *page,
-                            OCR_REASON_SUSPECTED_GARBLED_TEXT,
-                        );
-                    }
-                    let items: Vec<_> = items
-                        .into_iter()
-                        .filter(|i| !suppressed_pages.contains(&i.page))
-                        .collect();
-                    let rects: Vec<_> = rects
-                        .into_iter()
-                        .filter(|r| !suppressed_pages.contains(&r.page))
-                        .collect();
-                    let lines: Vec<_> = lines
-                        .into_iter()
-                        .filter(|l| !suppressed_pages.contains(&l.page))
-                        .collect();
-                    (items, rects, lines)
-                }
-            };
-
-            let selected_page = |page: u32| {
-                options
-                    .page_filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.contains(&page))
-            };
-            let rects: Vec<_> = rects
-                .into_iter()
-                .filter(|rect| selected_page(rect.page))
-                .collect();
-            let lines: Vec<_> = lines
-                .into_iter()
-                .filter(|line| selected_page(line.page))
-                .collect();
-            let gid_encoded_pages: HashSet<_> = gid_encoded_pages
-                .into_iter()
-                .filter(|page| selected_page(*page))
-                .collect();
-            let FolioFilteredItems {
-                items,
-                layout_items,
-                removal_mask,
-                removed_pages,
-            } = select_items_with_document_folio_context(
-                items,
-                page_count,
-                options.page_filter.as_ref(),
-            );
-
-            let text_quality = analyze_text_quality(&items);
-            merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
-            let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
-            let layout = compute_layout_complexity_with_chart_regions(
-                &items,
-                &layout_items,
-                &rects,
-                &lines,
-                &chart_regions,
-            );
-
-            let md = if options.mode == ProcessMode::Analyze {
-                None
-            } else {
-                Some(markdown::to_markdown_from_items_with_rects_and_lines(
-                    items,
-                    options.markdown,
-                    &rects,
-                    &lines,
-                    markdown::MarkdownDocumentContext {
-                        page_thresholds: &page_thresholds,
-                        struct_roles: struct_roles.as_ref(),
-                        struct_tables: &struct_tables,
-                        page_count,
-                        prefiltered_page_number_pages: Some(&removed_pages),
-                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
-                        precomputed_chart_regions: Some(&chart_regions),
-                    },
-                ))
-            };
-
-            let enc = !ocr_reasons_by_page.is_empty()
-                || text_quality.has_encoding_issues
-                || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
-            (
-                md,
-                layout,
-                enc,
-                gid_encoded_pages,
-                text_quality.pages_needing_ocr,
-                ocr_reasons_by_page,
-            )
-        }
-        None => (
-            None,
-            LayoutComplexity::default(),
-            false,
-            std::collections::HashSet::new(),
-            Vec::new(),
-            BTreeMap::new(),
-        ),
-    };
-
-    // If the extracted text is predominantly garbage (non-alphanumeric) and
-    // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
-    // layer comes from a bad OCR pass, and callers should use proper OCR.
-    let (pdf_type, markdown, confidence) =
-        if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
-            (PdfType::Scanned, None, 0.95)
-        } else {
-            (pdf_type, markdown, confidence)
-        };
-
-    // If a TextBased PDF produces garbage text, the fonts are undecodable
-    // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
-    // Drop the useless markdown and flag all pages for OCR.
-    let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
-        && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
-    {
-        log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
-        (None, true, true)
-    } else {
-        (markdown, has_encoding_issues, false)
-    };
-
-    // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list.
-    // When ALL pages have gid-encoded fonts, suppress unreliable markdown.
-    let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
-    let mut pages_needing_ocr = pages_needing_ocr;
-    if force_ocr_all {
-        pages_needing_ocr = (1..=page_count).collect();
-    }
-    if !gid_pages.is_empty() {
-        log::debug!("pages with gid-encoded fonts (need OCR): {:?}", gid_pages);
-        for page in gid_pages {
-            if !pages_needing_ocr.contains(&page) {
-                pages_needing_ocr.push(page);
-            }
-        }
-        pages_needing_ocr.sort_unstable();
-    }
-    if !text_quality_pages.is_empty() {
-        log::debug!(
-            "pages with OCR reason {} (need OCR): {:?}",
-            OCR_REASON_SUSPECTED_GARBLED_TEXT,
-            text_quality_pages
-        );
-        for page in text_quality_pages {
-            if !pages_needing_ocr.contains(&page) {
-                pages_needing_ocr.push(page);
-            }
-        }
-        pages_needing_ocr.sort_unstable();
-    }
-
-    // A short but readable text layer is still usable output. Text length alone
-    // cannot distinguish a legitimate short document from a sparse overlay on an
-    // image, so it must not create an OCR route without a page-level detector
-    // signal. Image-backed and mixed pages are routed above from those signals.
-
-    let markdown = if all_gid {
-        log::debug!(
-            "all {} pages have gid-encoded fonts — suppressing markdown output",
-            page_count
-        );
-        None
-    } else {
-        markdown
-    };
-
-    Ok(PdfProcessResult {
-        pdf_type,
-        markdown,
-        page_count,
-        processing_time_ms: start.elapsed_ms(),
-        pages_needing_ocr,
-        ocr_reasons_by_page: {
-            // Detector reasons (scanned / no_text / vector_text / garbled) merged
-            // with the markdown-stage garbled detection, deduped per page.
-            let mut merged = detection_ocr_reasons;
-            merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
-            page_ocr_reasons_vec(merged)
-        },
-        title,
-        confidence,
-        layout,
-        has_encoding_issues,
-    })
+    hybrid_markdown::process_document(doc, page_count, options, start)
 }
 
 // =========================================================================

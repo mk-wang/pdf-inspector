@@ -138,6 +138,43 @@ for page in &result.pages {
 println!("Complex layout? {}", result.is_complex);
 ```
 
+Prepare a complete document-level Markdown session when a host owns OCR:
+
+```rust
+use lopdf::Document;
+use pdf_inspector::{
+    prepare_hybrid_markdown, NormalizedRect, OcrPageResult, OcrToken, PdfOptions,
+};
+
+let document = Document::load("document.pdf")?;
+let session = prepare_hybrid_markdown(&document, PdfOptions::new())?;
+for request in session.ocr_requests() {
+    // Render `request.page` with the host OCR engine and convert its output
+    // to normalized top-left coordinates.
+    session.submit_ocr_page(OcrPageResult {
+        page: request.page,
+        tokens: vec![OcrToken {
+            text: "recognized text".into(),
+            bounds: NormalizedRect {
+                x: 0.1,
+                y: 0.1,
+                width: 0.3,
+                height: 0.05,
+            },
+            line_index: 0,
+            confidence: 0.99,
+        }],
+    })?;
+}
+let complete = session.finish()?;
+println!("{}", complete.markdown);
+```
+
+`prepare_hybrid_markdown` does not retain the `lopdf::Document`, execute OCR,
+or return partial Markdown. OCR pages must be submitted exactly once; an empty
+token list is a valid blank-page result. The session performs one final global
+Markdown pass after native and OCR positioned text have been combined.
+
 Extract structure-tree elements from tagged PDFs, and join them against
 `extract_text_with_positions` to attach semantic roles (heading levels,
 paragraphs, table cells) to extracted text:
@@ -184,6 +221,7 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `process_pdf_mem(bytes)` | Full processing from a byte buffer |
 | `detect_pdf_mem(bytes)` | Fast detection from a byte buffer |
 | `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
+| `prepare_hybrid_markdown(document, options)` | Prepare one OCR-completable global Markdown session from a loaded `lopdf::Document` |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with X/Y coordinates and font info |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
@@ -214,3 +252,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |
+| `HybridMarkdownSession` | Resumable OCR requests and one final global Markdown assembly |
+| `HybridMarkdownDocument` | Complete Markdown plus page provenance, classification, layout, and encoding metadata |
+| `OcrPageRequest` / `OcrPageResult` | 1-indexed OCR page request and host-submitted positioned OCR result |
+| `OcrToken` / `NormalizedRect` | OCR text and normalized top-left geometry |
