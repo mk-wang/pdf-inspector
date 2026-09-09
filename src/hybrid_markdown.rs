@@ -1014,7 +1014,14 @@ mod tests {
                         lopdf::content::Operation::new("q", vec![]),
                         lopdf::content::Operation::new(
                             "cm",
-                            vec![612.into(), 0.into(), 0.into(), 792.into(), 0.into(), 0.into()],
+                            vec![
+                                612.into(),
+                                0.into(),
+                                0.into(),
+                                792.into(),
+                                0.into(),
+                                0.into(),
+                            ],
                         ),
                         lopdf::content::Operation::new("Do", vec![Object::Name(b"Im1".to_vec())]),
                         lopdf::content::Operation::new("Q", vec![]),
