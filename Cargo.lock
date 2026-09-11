@@ -531,7 +531,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "lopdf"
 version = "0.44.0"
-source = "git+https://github.com/mk-wang/lopdf.git?rev=4a4ac10a734bbad5ab3785662526197849a848ca#4a4ac10a734bbad5ab3785662526197849a848ca"
+source = "git+https://github.com/mk-wang/lopdf.git?rev=a2506c4fa0b44b4a67c067e594aa39082bb2cc09#a2506c4fa0b44b4a67c067e594aa39082bb2cc09"
 dependencies = [
  "aes",
  "bitflags 2.13.1",
