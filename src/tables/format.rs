@@ -59,6 +59,21 @@ pub fn table_to_markdown(table: &Table) -> String {
     output
 }
 
+/// True when a detected data table survives formatting cleanup with a header,
+/// at least one body row, and at least two columns.
+///
+/// Supplemental OCR uses this at the structured-table boundary so incomplete
+/// detections cannot modify an otherwise clean native page.
+#[cfg(any(test, feature = "ocr"))]
+pub(crate) fn is_complete_data_table(table: &Table) -> bool {
+    if table.kind != TableKind::Data {
+        return false;
+    }
+
+    let (cleaned_cells, _) = clean_table_cells(&table.cells);
+    cleaned_cells.len() >= 2 && cleaned_cells.first().is_some_and(|row| row.len() >= 2)
+}
+
 /// Render a table-of-contents as a flat per-row text block.
 ///
 /// Each row becomes one line: non-empty cells joined with spaces, and the
@@ -75,7 +90,19 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
             continue;
         };
 
+        // Leader dots glued to the page number ("..19") still read as a
+        // page cell; the dots are the leader, not the value.
         let last_cell = trimmed[last_idx];
+        let last_cell = if last_cell.starts_with('.') || last_cell.starts_with('\u{2026}') {
+            let stripped = last_cell.trim_start_matches(['.', '\u{2026}', ' ']);
+            if !stripped.is_empty() && is_page_number_cell(stripped) {
+                stripped
+            } else {
+                last_cell
+            }
+        } else {
+            last_cell
+        };
         let last_is_page = is_page_number_cell(last_cell);
 
         let (title_cells, trailing) = if last_is_page && last_idx > 0 {
@@ -127,6 +154,16 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
 ///   - dashed section-page IDs: "5-21", "A-1", "B--3", "TC-2" (common in
 ///     technical manuals)
 fn is_page_number_cell(cell: &str) -> bool {
+    // A label whose base has letters and carries a letter subscript or
+    // superscript (`V<sub>f</sub>`, `x<sub>i</sub>`) is never a page number,
+    // whatever its letters spell as roman numerals. On a digit-only base
+    // every span is a footnote marker (`12<sup>a</sup>`, `12<sup>1)</sup>`)
+    // and is dropped before the page-number test.
+    let base = super::cell_text::strip_script_spans(cell);
+    if base.chars().any(char::is_alphabetic) && super::cell_text::has_letter_script_span(cell) {
+        return false;
+    }
+    let cell = base;
     let tokens: Vec<&str> = cell.split_whitespace().collect();
     if tokens.is_empty() {
         return false;
@@ -293,29 +330,39 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .map(|c| c.trim())
             .filter(|c| !c.is_empty())
             .collect();
-        let is_short_subheader = non_first_cells.len() == 1 && non_first_cells[0].len() <= 5;
+        // Lengths are measured without `<sup>`/`<sub>` tags (content kept):
+        // `IV<sub>subc</sub>` is the six-character token it looks like.
+        let plain_cells: Vec<std::borrow::Cow<'_, str>> = non_first_cells
+            .iter()
+            .map(|c| super::cell_text::strip_script_markup(c))
+            .collect();
+        let is_short_subheader = plain_cells.len() == 1 && plain_cells[0].len() <= 5;
         // Rows with multiple short-valued cells (e.g. numeric data in a lookup
         // table) are data rows with a merged/spanning first column, not text
         // overflow from the previous row.  Continuation rows typically have
         // longer descriptive text; data rows have short numeric values.
-        let avg_cell_len = if non_first_cells.is_empty() {
+        let avg_cell_len = if plain_cells.is_empty() {
             0.0
         } else {
-            non_first_cells.iter().map(|c| c.len()).sum::<usize>() as f32
-                / non_first_cells.len() as f32
+            plain_cells.iter().map(|c| c.len()).sum::<usize>() as f32 / plain_cells.len() as f32
         };
+        // Numeric-ness is judged on the value alone — a footnote marker is an
+        // annotation, so `12<sup>1)</sup>` is the number 12 and a cell that
+        // holds only a marker is a numeric row's annotation column.
         let numeric_cells = non_first_cells
             .iter()
             .filter(|c| {
-                c.chars().all(|ch| {
-                    ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
-                })
+                let value = super::cell_text::strip_marker_spans(c);
+                value.trim().is_empty()
+                    || value.chars().all(|ch| {
+                        ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
+                    })
             })
             .count();
         let looks_like_data_row = non_first_cells.len() >= 2
             && avg_cell_len <= 10.0
             && numeric_cells > non_first_cells.len() / 2;
-        let uppercase_leading_cells = non_first_cells
+        let uppercase_leading_cells = plain_cells
             .iter()
             .filter(|cell| starts_with_uppercase_word(cell))
             .count();
@@ -442,6 +489,16 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
 fn is_footnote_row(text: &str) -> bool {
     let trimmed = text.trim();
 
+    // Japanese documents commonly use the reference mark followed by an
+    // ASCII or full-width number (for example `※1` / `※１`). These rows often
+    // sit immediately below a wide table and must not be merged into its last
+    // data row as wrapped first-column content.
+    if let Some(rest) = trimmed.strip_prefix('※') {
+        return rest.chars().next().is_some_and(|character| {
+            character.is_ascii_digit() || ('０'..='９').contains(&character)
+        });
+    }
+
     // Check for common footnote patterns
     // (1), (2), etc.
     if trimmed.starts_with('(') && trimmed.len() >= 2 {
@@ -501,6 +558,13 @@ mod tests {
     fn test_is_footnote_row_notes_colon() {
         assert!(is_footnote_row("Notes: multiple"));
         assert!(is_footnote_row("NOTES: uppercase"));
+    }
+
+    #[test]
+    fn test_is_footnote_row_reference_mark_number() {
+        assert!(is_footnote_row("※1 explanation"));
+        assert!(is_footnote_row("※１ 説明"));
+        assert!(!is_footnote_row("※ general marker"));
     }
 
     #[test]
@@ -884,6 +948,29 @@ mod tests {
     }
 
     #[test]
+    fn complete_data_table_requires_header_body_and_two_columns() {
+        let complete = Table {
+            columns: vec![100.0, 200.0, 300.0],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec!["Metric".into(), "Value".into()],
+                vec!["Accuracy".into(), "95%".into()],
+            ],
+            item_indices: vec![],
+            kind: TableKind::Data,
+        };
+        assert!(is_complete_data_table(&complete));
+
+        let mut single_row = complete.clone();
+        single_row.cells.truncate(1);
+        assert!(!is_complete_data_table(&single_row));
+
+        let mut toc = complete;
+        toc.kind = TableKind::Toc;
+        assert!(!is_complete_data_table(&toc));
+    }
+
+    #[test]
     fn test_table_to_markdown_empty_table() {
         let table = Table {
             columns: vec![],
@@ -978,5 +1065,15 @@ mod tests {
         );
         assert!(md.contains("4.3 Case studies and targeted evaluations\t86"));
         assert!(md.contains("4.5 White-box analyses\t113"));
+    }
+
+    #[test]
+    fn scripted_labels_are_not_page_numbers() {
+        assert!(!is_page_number_cell("V<sub>f</sub>"));
+        assert!(!is_page_number_cell("x<sub>i</sub>"));
+        assert!(is_page_number_cell("12<sup>1)</sup>"));
+        assert!(is_page_number_cell("12<sup>a</sup>"));
+        assert!(is_page_number_cell("xi<sup>1)</sup>"));
+        assert!(is_page_number_cell("xi"));
     }
 }

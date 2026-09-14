@@ -642,8 +642,10 @@ fn hex_to_unicode_string(hex: &str) -> Option<String> {
 
     if bytes.len().is_multiple_of(2) {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect();
         if let Ok(result) = String::from_utf16(&units) {
             if !result.is_empty() {
@@ -876,8 +878,8 @@ fn parse_cid_to_gid_stream(data: &[u8]) -> Option<Vec<u16>> {
         return None;
     }
     let mut map = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        map.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+    for chunk in data.as_chunks::<2>().0 {
+        map.push(u16::from_be_bytes(*chunk));
     }
     Some(map)
 }
@@ -1610,8 +1612,8 @@ fn bytes_to_unicode_string(bytes: &[u8]) -> Option<String> {
         return Some(bytes.iter().map(|&b| b as char).collect());
     }
     let mut out = String::new();
-    for chunk in bytes.chunks_exact(2) {
-        let cp = u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    for chunk in bytes.as_chunks::<2>().0 {
+        let cp = u16::from_be_bytes(*chunk) as u32;
         if let Some(ch) = char::from_u32(cp) {
             out.push(ch);
         }
@@ -2766,26 +2768,34 @@ impl FontCMaps {
             }
 
             // Try parsing embedded TrueType/OpenType cmap
-            if let Some(ff_ref) = font_file_ref {
+            let font_data: Option<Vec<u8>> = if let Some(ff_ref) = font_file_ref {
                 if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                    let data =
-                        crate::decompressed_stream_content_or_raw(stream, max_decompressed_size)?;
-                    if let Some(cmap) = build_cmap_from_truetype(&data) {
-                        debug!(
-                            "TrueType CMap obj={:<6} (embedded font) char_map={}",
-                            lookup_key,
-                            cmap.char_map.len()
-                        );
-                        by_obj_num.insert(
-                            lookup_key,
-                            CMapEntry {
-                                primary: cmap,
-                                remapped: None,
-                                fallback: None,
-                            },
-                        );
-                        resolved = true;
-                    }
+                    Some(crate::decompressed_stream_content_or_raw(
+                        stream,
+                        max_decompressed_size,
+                    )?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(data) = font_data.as_deref() {
+                if let Some(cmap) = build_cmap_from_truetype(data) {
+                    debug!(
+                        "TrueType CMap obj={:<6} (embedded font) char_map={}",
+                        lookup_key,
+                        cmap.char_map.len()
+                    );
+                    by_obj_num.insert(
+                        lookup_key,
+                        CMapEntry {
+                            primary: cmap,
+                            remapped: None,
+                            fallback: None,
+                        },
+                    );
+                    resolved = true;
                 }
             }
 
@@ -2794,6 +2804,37 @@ impl FontCMaps {
                 if let Some(cmap) = build_cmap_from_cid_system_info(cid_font_dict, doc) {
                     debug!(
                         "Predefined CMap obj={:<6} (CIDSystemInfo) char_map={}",
+                        lookup_key,
+                        cmap.char_map.len()
+                    );
+                    by_obj_num.insert(
+                        lookup_key,
+                        CMapEntry {
+                            primary: cmap,
+                            remapped: None,
+                            fallback: None,
+                        },
+                    );
+                    resolved = true;
+                }
+            }
+
+            // A subset stripped of both its cmap and its glyph names leaves
+            // only the glyph order; fonts that keep the standard Macintosh
+            // ordering still decode, when their metrics corroborate it. A
+            // predefined CID collection above is authoritative and wins. The
+            // CID-as-Unicode passthrough below is not vetoed by the /W
+            // median: a Unicode-keyed font has its digits at 0x30-0x39 and
+            // nothing at glyph slots 19-28, so the corroboration itself
+            // declines it, while a Mac-order subset's letter GIDs (68-93)
+            // would push the median past the passthrough threshold.
+            if !resolved && crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc) {
+                if let Some(cmap) = font_data
+                    .as_deref()
+                    .and_then(crate::mac_glyph_order::build_cmap_from_mac_glyph_order)
+                {
+                    debug!(
+                        "Standard Macintosh glyph order obj={:<6} (embedded font without cmap) char_map={}",
                         lookup_key,
                         cmap.char_map.len()
                     );

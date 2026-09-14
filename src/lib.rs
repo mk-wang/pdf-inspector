@@ -36,6 +36,7 @@ pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
 pub mod hybrid_markdown;
+mod mac_glyph_order;
 pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
@@ -44,14 +45,18 @@ mod text_quality;
 pub mod text_utils;
 pub mod tounicode;
 pub mod types;
+pub mod vision;
+mod xref_repair;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
+pub use extractor::geometry::PageRotation;
 pub use extractor::{
-    extract_text, extract_text_with_positions, extract_text_with_positions_mem,
-    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+    extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
+    extract_text_with_positions_mem, extract_text_with_positions_pages,
+    extract_text_with_positions_pages_with_password,
 };
 pub use hybrid_markdown::{
     prepare_hybrid_markdown, HybridMarkdownDocument, HybridMarkdownError, HybridMarkdownPage,
@@ -529,6 +534,14 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
+pub(crate) struct InternalPagesExtraction {
+    pub(crate) result: PagesExtractionResult,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) page_count: u32,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+}
+
 /// Extract formatted markdown for pages of a PDF, with layout
 /// classification metadata.
 ///
@@ -551,8 +564,44 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        None,
+        &MarkdownOptions::default(),
+        false,
+        false,
+    )
+    .map(|extraction| extraction.result)
+}
+
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub(crate) fn extract_pages_markdown_mem_for_ocr(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+) -> Result<InternalPagesExtraction, PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        password,
+        markdown_options,
+        markdown_options.strip_headers_footers,
+        true,
+    )
+}
+
+fn extract_pages_markdown_mem_impl(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+    strip_repeated_headers_footers: bool,
+    preserve_ocr_candidates: bool,
+) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -564,7 +613,7 @@ pub fn extract_pages_markdown_mem(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -595,6 +644,11 @@ pub fn extract_pages_markdown_mem(
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
+    let repeated_header_footer_items = if strip_repeated_headers_footers {
+        repeated_header_footer_item_keys(&all_items, &page_thresholds, &chart_regions, page_count)
+    } else {
+        HashSet::new()
+    };
 
     // When caller doesn't specify pages, return every page in document order.
     let all_pages: Vec<u32>;
@@ -609,6 +663,8 @@ pub fn extract_pages_markdown_mem(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
@@ -630,7 +686,10 @@ pub fn extract_pages_markdown_mem(
         let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
             .iter()
             .zip(&page_number_removal_mask)
-            .filter(|(item, _)| item.page == page_1idx)
+            .filter(|(item, _)| {
+                item.page == page_1idx
+                    && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
+            })
             .map(|(item, remove)| (item.clone(), *remove))
             .unzip();
 
@@ -639,6 +698,23 @@ pub fn extract_pages_markdown_mem(
             .filter(|r| r.page == page_1idx)
             .cloned()
             .collect();
+
+        let page_lines: Vec<types::PdfLine> = all_lines
+            .iter()
+            .filter(|l| l.page == page_1idx)
+            .cloned()
+            .collect();
+
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        {
+            let image_regions: Vec<PdfRect> = page_items
+                .iter()
+                .filter_map(supplemental_ocr_image_region)
+                .collect();
+            if !image_regions.is_empty() {
+                supplemental_ocr_regions.insert(page_1idx, image_regions);
+            }
+        }
 
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
@@ -667,7 +743,7 @@ pub fn extract_pages_markdown_mem(
             base_font_size: Some(font_stats.most_common_size),
             include_page_numbers: false,
             strip_headers_footers: false,
-            ..MarkdownOptions::default()
+            ..markdown_options.clone()
         };
 
         let md = if has_text_quality_issue {
@@ -677,7 +753,7 @@ pub fn extract_pages_markdown_mem(
                 page_items,
                 options,
                 &page_rects,
-                &[],
+                &page_lines,
                 markdown::MarkdownDocumentContext {
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
@@ -721,20 +797,184 @@ pub fn extract_pages_markdown_mem(
 
         results.push(PageMarkdown {
             page: page_0idx,
-            markdown: if needs_ocr { String::new() } else { md },
+            // The public native extractor continues to suppress unreliable
+            // text. The OCR orchestrator retains clean partial text
+            // internally so it can compare/fuse it with OCR before deciding
+            // what is safe to return.
+            markdown: if needs_ocr && !preserve_ocr_candidates {
+                String::new()
+            } else {
+                md
+            },
             needs_ocr,
             ocr_reason,
         });
     }
 
-    Ok(PagesExtractionResult {
-        pages: results,
-        pages_with_tables: complexity.pages_with_tables,
-        pages_with_columns: complexity.pages_with_columns,
-        pages_needing_ocr,
-        ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
-        is_complex: complexity.is_complex,
+    Ok(InternalPagesExtraction {
+        result: PagesExtractionResult {
+            pages: results,
+            pages_with_tables: complexity.pages_with_tables,
+            pages_with_columns: complexity.pages_with_columns,
+            pages_needing_ocr,
+            ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
+            is_complex: complexity.is_complex,
+        },
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        page_count,
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        supplemental_ocr_regions,
     })
+}
+
+/// Image regions large enough to plausibly contain rasterized document
+/// structure such as a table. Logos, icons, and decorative rules remain below
+/// these physical-size gates. OCR still has to produce a valid table inside
+/// the region before any text is fused into a clean native page.
+#[cfg(any(test, all(feature = "ocr", not(target_arch = "wasm32"))))]
+fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
+    const MIN_WIDTH_PT: f32 = 108.0;
+    const MIN_HEIGHT_PT: f32 = 72.0;
+    const MIN_AREA_PT2: f32 = 20_000.0;
+
+    if !matches!(item.item_type, types::ItemType::Image)
+        || !item.x.is_finite()
+        || !item.y.is_finite()
+        || !item.width.is_finite()
+        || !item.height.is_finite()
+    {
+        return None;
+    }
+    let x = item.x.min(item.x + item.width);
+    let y = item.y.min(item.y + item.height);
+    let width = item.width.abs();
+    let height = item.height.abs();
+    (width >= MIN_WIDTH_PT && height >= MIN_HEIGHT_PT && width * height >= MIN_AREA_PT2).then_some(
+        PdfRect {
+            x,
+            y,
+            width,
+            height,
+            page: item.page,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HeaderFooterItemKey {
+    page: u32,
+    x: u32,
+    y: u32,
+    text: String,
+}
+
+impl From<&TextItem> for HeaderFooterItemKey {
+    fn from(item: &TextItem) -> Self {
+        Self {
+            page: item.page,
+            x: item.x.to_bits(),
+            y: item.y.to_bits(),
+            text: item.text.clone(),
+        }
+    }
+}
+
+fn repeated_header_footer_item_keys(
+    items: &[TextItem],
+    page_thresholds: &HashMap<u32, f32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    page_count: u32,
+) -> HashSet<HeaderFooterItemKey> {
+    let candidates = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.item_type,
+                types::ItemType::Text | types::ItemType::FormField
+            )
+        })
+        .cloned()
+        .collect();
+    let lines = extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+        candidates,
+        page_thresholds,
+        &HashSet::new(),
+        chart_regions,
+    );
+    let all_items: HashSet<_> = lines
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    let kept = markdown::strip_repeated_header_footer_lines(lines, page_count);
+    let kept_items: HashSet<_> = kept
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    all_items.difference(&kept_items).cloned().collect()
+}
+
+#[cfg(all(test, feature = "ocr", not(target_arch = "wasm32")))]
+mod ocr_header_footer_tests {
+    use super::*;
+
+    fn item(page: u32, text: &str, y: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 10.0,
+            y,
+            width: 120.0,
+            height: 10.0,
+            font: "Test".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: types::ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn local_pipeline_prefilters_document_wide_repeated_headers() {
+        let mut items = Vec::new();
+        let mut thresholds = HashMap::new();
+        for page in 1..=3 {
+            items.push(item(page, "Repeated report header", 800.0));
+            for line in 0..12 {
+                items.push(item(
+                    page,
+                    &format!("Page {page} paragraph {line} unique content"),
+                    700.0 - line as f32 * 40.0,
+                ));
+            }
+            thresholds.insert(page, 0.1);
+        }
+
+        let removed = repeated_header_footer_item_keys(&items, &thresholds, &HashMap::new(), 3);
+        assert_eq!(removed.len(), 2);
+        for page in 1..=3 {
+            assert_eq!(
+                removed.contains(&HeaderFooterItemKey::from(&item(
+                    page,
+                    "Repeated report header",
+                    800.0,
+                ))),
+                page > 1,
+            );
+            assert!(!removed.contains(&HeaderFooterItemKey::from(&item(
+                page,
+                &format!("Page {page} paragraph 5 unique content"),
+                500.0,
+            ))));
+        }
+    }
 }
 
 /// Path-based wrapper for [`extract_pages_markdown_mem`].
@@ -881,8 +1121,11 @@ fn non_placeholder_alnum(items: &[TextItem]) -> usize {
 ///
 /// * `buffer` — PDF file bytes
 /// * `page_regions` — list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
-///   Coordinates are in **PDF points** with **top-left origin** (matching typical
-///   layout model output after coordinate conversion).
+///   Coordinates are in **PDF points** with **top-left origin**, relative to
+///   the page's **visible page box** (`CropBox ∩ MediaBox`, else the
+///   MediaBox) — the frame of a rendered page image, and the frame
+///   [`extract_text_with_positions_mem`] reports items in (with `y` flipped
+///   by the box height). `/Rotate` is not applied.
 ///
 /// # Returns
 ///
@@ -908,7 +1151,7 @@ pub fn extract_text_in_regions_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
@@ -916,24 +1159,28 @@ pub fn extract_text_in_regions_mem(
             continue;
         }
 
-        // Get page height from MediaBox for coordinate flip
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        // Extract text items for this page. The Form XObject budget is shared
-        // with the invisible-layer retry below so one page cannot consume two
-        // full expansion budgets.
+        // Extract text items for this page in the visible-page-box frame;
+        // region bounds flip y with that box's height. The Form XObject
+        // budget is shared with the invisible-layer retry below so one page
+        // cannot consume two full expansion budgets.
         let mut form_budget = extractor::FormWalkBudget::new();
-        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut form_budget,
-            )?;
+        let extractor::PageBoxExtraction {
+            mut items,
+            has_gid_fonts: mut has_gid,
+            mut coords_rotated,
+            skipped_invisible,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+            &mut form_budget,
+        )?;
+        page_heights.insert(*page_num, page_box.height());
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
         // pass sees nothing there but `[Image: ...]` placeholders, so every
@@ -953,17 +1200,16 @@ pub fn extract_text_in_regions_mem(
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
-                extractor::content_stream::extract_page_text_items(
-                    &doc,
-                    page_id,
-                    *page_num,
-                    &font_cmaps,
-                    true,
-                    &mut style_cache,
-                    &mut form_budget,
-                )
-            {
+            if let Ok(invisible) = extractor::extract_page_text_items_in_page_box(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                true,
+                &mut style_cache,
+                &mut form_budget,
+            ) {
+                let inv_items = invisible.items;
                 let inv_alnum = non_placeholder_alnum(&inv_items);
                 // Judge the WHOLE recovered layer, not a prefix — a broken
                 // OCR layer can hide its garbage past any fixed sample size
@@ -975,8 +1221,8 @@ pub fn extract_text_in_regions_mem(
                     .collect();
                 if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
                     items = inv_items;
-                    has_gid = inv_gid;
-                    coords_rotated = inv_rotated;
+                    has_gid = invisible.has_gid_fonts;
+                    coords_rotated = invisible.coords_rotated;
                 }
             }
         }
@@ -987,8 +1233,8 @@ pub fn extract_text_in_regions_mem(
         if has_gid {
             gid_pages.insert(*page_num);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
     }
@@ -1002,11 +1248,10 @@ pub fn extract_text_in_regions_mem(
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let _page_has_gid = gid_pages.contains(&page_1idx);
         let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -1104,6 +1349,7 @@ pub fn extract_text_in_regions_mem(
 ///
 /// Similar to [`extract_text_in_regions_mem`] but runs table detection on items
 /// within each region and returns markdown pipe-tables instead of flat text.
+/// Regions use the same visible-page-box coordinate frame.
 ///
 /// When table structure is detected, `text` contains a markdown pipe-table and
 /// `needs_ocr` is `false`. When no table is found (too few items, poor alignment,
@@ -1126,26 +1372,31 @@ pub fn extract_tables_in_regions_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
             continue;
         }
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
-            )?;
+        let extractor::PageBoxExtraction {
+            mut items,
+            rects,
+            lines,
+            has_gid_fonts: has_gid,
+            coords_rotated,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+            &mut extractor::FormWalkBudget::new(),
+        )?;
+        page_heights.insert(*page_num, page_box.height());
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -1153,8 +1404,8 @@ pub fn extract_tables_in_regions_mem(
         if has_gid {
             gid_pages.insert(*page_num);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
         rects_by_page.insert(*page_num, rects);
@@ -1168,11 +1419,10 @@ pub fn extract_tables_in_regions_mem(
         let items = items_by_page.get(&page_1idx);
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let _page_has_gid = gid_pages.contains(&page_1idx);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
 
         let mut page_results = Vec::with_capacity(regions.len());
 
@@ -1430,6 +1680,10 @@ enum VectorGridSource {
 /// The returned shape intentionally matches [`TsrTableInput`]'s structure
 /// fields so callers can hand it to `extract_tables_with_structure_*` and let
 /// the existing PDF-text cell fill path populate contents.
+///
+/// `region_pdf_pt_bbox` is `[x1, y1, x2, y2]` in PDF points, top-left origin,
+/// relative to the visible page box (see [`extract_text_in_regions_mem`]).
+/// The returned cell bboxes are crop-image pixels.
 pub fn detect_vector_grid_in_region_mem(
     buffer: &[u8],
     page_idx: u32,
@@ -1447,25 +1701,27 @@ pub fn detect_vector_grid_in_region_mem(
 
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
-    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
-        extractor::content_stream::extract_page_text_items(
-            &doc,
-            page_id,
-            page_1idx,
-            &font_cmaps,
-            false,
-            &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
-        )?;
+    let extractor::PageBoxExtraction {
+        mut items,
+        rects,
+        lines,
+        coords_rotated,
+        page_box,
+        ..
+    } = extractor::extract_page_text_items_in_page_box(
+        &doc,
+        page_id,
+        page_1idx,
+        &font_cmaps,
+        false,
+        &mut extractor::FontStyleCache::new(),
+        &mut extractor::FormWalkBudget::new(),
+    )?;
+    let page_h = page_box.height();
     text_utils::fix_letterspaced_items(&mut items);
 
-    let coords = if coords_rotated {
-        RegionCoordSpace::Rotated90Ccw
-    } else {
-        RegionCoordSpace::Standard
-    };
-    if matches!(coords, RegionCoordSpace::Rotated90Ccw) {
+    let coords = RegionCoordSpace::from(coords_rotated);
+    if coords != RegionCoordSpace::Standard {
         // TODO: add a rotated-page vector-grid fixture before enabling this.
         // The TSR crop contract is top-left page coordinates, while rotated
         // extraction normalizes vector geometry into a synthetic coordinate
@@ -2344,6 +2600,7 @@ fn extracted_bbox_to_page_top_left(
         RegionCoordSpace::Rotated90Ccw => {
             [-y_max, page_height - x_max, -y_min, page_height - x_min]
         }
+        RegionCoordSpace::Rotated90Cw => [y_min, page_height + x_min, y_max, page_height + x_max],
     }
 }
 
@@ -2363,7 +2620,8 @@ pub struct TsrTableInput {
     /// 0-indexed page number where the crop was taken from.
     pub page: u32,
     /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
-    /// **top-left origin** (matches the layout model's coordinate space).
+    /// **top-left origin**, relative to the visible page box — the frame of
+    /// a rendered page image (see [`extract_text_in_regions_mem`]).
     pub crop_pdf_pt_bbox: [f32; 4],
     /// DPI the crop image was rendered at (e.g. `200.0`). Used to convert
     /// cell bboxes from image-pixels back to PDF points.
@@ -2415,32 +2673,34 @@ pub fn extract_tables_with_structure_cells_mem(
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
             continue;
         }
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
-            )?;
+        let extractor::PageBoxExtraction {
+            mut items,
+            coords_rotated,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+            &mut extractor::FormWalkBudget::new(),
+        )?;
+        page_heights.insert(*page_num, page_box.height());
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
     }
@@ -2456,11 +2716,10 @@ pub fn extract_tables_with_structure_cells_mem(
         };
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
 
         let crop_origin = [input.crop_pdf_pt_bbox[0], input.crop_pdf_pt_bbox[1]];
 
@@ -2551,7 +2810,7 @@ pub fn extract_tables_with_structure_cells_mem(
             for token_item in token_subitems {
                 let token_w = text_utils::effective_width(&token_item);
                 let token_cx = token_item.x + token_w * 0.5;
-                let token_cy = token_item.y + token_item.height * 0.5;
+                let token_cy = token_item.y + text_utils::effective_height(&token_item) * 0.5;
                 let mut best: Option<(usize, f32)> = None;
                 for (cell_idx, meta) in cell_meta.iter().enumerate() {
                     let Some((bounds, ccx, ccy)) = meta else {
@@ -2621,19 +2880,32 @@ pub fn extract_tables_with_structure_cells_mem(
 /// distribute the words to whichever cells their estimated centers fall
 /// into.
 ///
-/// The character-width estimate is `effective_width / char_count`.
-/// `effective_width` returns the explicit `item.width` when known and
-/// otherwise falls back to `char_count * font_size * 0.5`. Either way the
-/// estimate is uniform across the item — fine for routing, since we only
-/// need to know which cell each token's center lands in, not its exact
-/// position. Single-token items collapse to a one-element vector
-/// equivalent to the input item, making this a no-op for the common case.
+/// The character-width estimate is `item.width / char_count`. A run with a
+/// known zero advance keeps all its tokens at its origin — that is where
+/// they were drawn; only a run whose advance is unknown (and somehow has no
+/// box) is spread over half an em per character for the interpolation. The
+/// estimate is uniform across the item —
+/// fine for routing, since we only need to know which cell each token's
+/// center lands in, not its exact position. Single-token items collapse to
+/// a one-element vector equivalent to the input item, making this a no-op
+/// for the common case.
 fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
     let total_chars = item.text.chars().count();
     if total_chars == 0 {
         return Vec::new();
     }
-    let item_w = text_utils::effective_width(item);
+    // Token positions are interpolated along +x, the reading direction of
+    // an upright run only. A rotated run (vertical table header) or an
+    // upside-down one, whose tokens advance towards -x, stays one item: its
+    // box already routes it to the right cell.
+    if !item.is_upright() {
+        return vec![item.clone()];
+    }
+    let item_w = if item.width > 0.0 || item.advance_known {
+        item.width
+    } else {
+        total_chars as f32 * item.font_size * 0.5
+    };
     let char_w = item_w / total_chars as f32;
 
     let mut tokens: Vec<TextItem> = Vec::new();
@@ -2732,6 +3004,13 @@ fn tsr_assign_orphan_items(
     if cap_x <= 0.0 || cap_y <= 0.0 {
         return;
     }
+    // The caps come from the cells' page-coordinate boxes; in a turned frame
+    // the page's horizontal extent runs along the frame's y axis and vice
+    // versa, so swap them (and the same-line tolerance derived from cap_y).
+    let (cap_x, cap_y) = match coord_space {
+        RegionCoordSpace::Standard => (cap_x, cap_y),
+        RegionCoordSpace::Rotated90Ccw | RegionCoordSpace::Rotated90Cw => (cap_y, cap_x),
+    };
     // Y-tolerance for "same line as a previous orphan" — multi-token branch
     // names like "Blue Valley Parkway" are 3 separate text items and should
     // all stack into the same cell. But two orphans on different rows of
@@ -2770,7 +3049,7 @@ fn tsr_assign_orphan_items(
             continue;
         }
         let cx = item.x + item_w * 0.5;
-        let cy = item.y + item.height * 0.5;
+        let cy = item.y + text_utils::effective_height(item) * 0.5;
 
         let mut best: Option<(usize, f32)> = None;
         for (ci, bounds_opt) in cell_bounds.iter().enumerate() {
@@ -2876,8 +3155,8 @@ struct TsrCellTextLine {
 
 impl TsrCellTextLine {
     fn new(item: TextItem) -> Self {
-        let center_y = item.y + item.height * 0.5;
-        let half_height = (item.height * 0.5).max(2.5);
+        let center_y = item.y + text_utils::effective_height(&item) * 0.5;
+        let half_height = (text_utils::effective_height(&item) * 0.5).max(2.5);
         Self {
             center_y,
             half_height,
@@ -2886,10 +3165,12 @@ impl TsrCellTextLine {
     }
 
     fn add(&mut self, item: TextItem) {
-        let center_y = item.y + item.height * 0.5;
+        let center_y = item.y + text_utils::effective_height(&item) * 0.5;
         let existing = self.items.len() as f32;
         self.center_y = (self.center_y * existing + center_y) / (existing + 1.0);
-        self.half_height = self.half_height.max((item.height * 0.5).max(2.5));
+        self.half_height = self
+            .half_height
+            .max((text_utils::effective_height(&item) * 0.5).max(2.5));
         self.items.push(item);
     }
 
@@ -2938,8 +3219,8 @@ fn cluster_tsr_cell_text_lines(mut items: Vec<TextItem>) -> Vec<TsrCellTextLine>
 
     let mut lines: Vec<TsrCellTextLine> = Vec::new();
     for item in items {
-        let item_top = item.y + item.height;
-        let item_half_height = (item.height * 0.5).max(2.5);
+        let item_top = item.y + text_utils::effective_height(&item);
+        let item_half_height = (text_utils::effective_height(&item) * 0.5).max(2.5);
         if let Some(last) = lines.last_mut() {
             let gap = last.bottom_y() - item_top;
             if gap <= last.half_height.max(item_half_height) {
@@ -3224,26 +3505,26 @@ fn detect_tsr_quality_issue(
     let Some(&page_id) = pages.get(&page_1idx) else {
         return Ok(None);
     };
-    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
-        extractor::content_stream::extract_page_text_items(
-            &doc,
-            page_id,
-            page_1idx,
-            &font_cmaps,
-            false,
-            &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
-        )?;
+    let extractor::PageBoxExtraction {
+        mut items,
+        coords_rotated,
+        page_box,
+        ..
+    } = extractor::extract_page_text_items_in_page_box(
+        &doc,
+        page_id,
+        page_1idx,
+        &font_cmaps,
+        false,
+        &mut extractor::FontStyleCache::new(),
+        &mut extractor::FormWalkBudget::new(),
+    )?;
+    let page_h = page_box.height();
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
-    let coords = if coords_rotated {
-        RegionCoordSpace::Rotated90Ccw
-    } else {
-        RegionCoordSpace::Standard
-    };
+    let coords = RegionCoordSpace::from(coords_rotated);
     let expanded_cells =
         try_expand_multi_row_cells(cells, &items, page_h, coords, adaptive_threshold);
     let first_row = cells.iter().map(|cell| cell.row).min().unwrap_or(0);
@@ -3409,43 +3690,28 @@ pub fn extract_tables_with_structure_auto_mem(
     Ok(results)
 }
 
-/// Get page height in points from MediaBox.
-fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
-    let page_dict = doc.get_dictionary(page_id).ok()?;
-    // Try MediaBox directly, then follow reference
-    let media_box = page_dict.get(b"MediaBox").ok()?;
-    let arr = match media_box {
-        lopdf::Object::Array(a) => a,
-        lopdf::Object::Reference(r) => {
-            if let Ok(lopdf::Object::Array(a)) = doc.get_object(*r) {
-                a
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
-    if arr.len() >= 4 {
-        let y1 = obj_to_f32(&arr[1])?;
-        let y2 = obj_to_f32(&arr[3])?;
-        Some((y2 - y1).abs())
-    } else {
-        None
-    }
-}
-
-fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
-    match obj {
-        lopdf::Object::Integer(i) => Some(*i as f32),
-        lopdf::Object::Real(f) => Some(*f),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy)]
+/// Coordinate frame the extracted items of a page live in: plain page
+/// coordinates, or the frame turned by the rotated-page correction (see
+/// `extractor::geometry::PageRotation`). Region boxes arrive in page
+/// coordinates and are turned the same way before matching items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegionCoordSpace {
     Standard,
+    /// Frame turned for a counter-clockwise page: `(x, y) → (y, -x)`.
     Rotated90Ccw,
+    /// Frame turned for a clockwise page: `(x, y) → (-y, x)`.
+    Rotated90Cw,
+}
+
+impl From<extractor::geometry::PageRotation> for RegionCoordSpace {
+    fn from(rotation: extractor::geometry::PageRotation) -> Self {
+        use extractor::geometry::PageRotation;
+        match rotation {
+            PageRotation::Upright => RegionCoordSpace::Standard,
+            PageRotation::Ccw => RegionCoordSpace::Rotated90Ccw,
+            PageRotation::Cw => RegionCoordSpace::Rotated90Cw,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3458,6 +3724,18 @@ struct RegionBounds {
 
 /// Collect text items that fall within a region bbox (top-left origin, PDF points)
 /// and return them as a single string in reading order.
+///
+/// `page_height` is the height of the frame the items live in — the visible
+/// page box height for items from [`extract_text_with_positions_mem`].
+///
+/// Items from a page whose text was predominantly rotated live in a turned
+/// coordinate frame (see [`PageRotation`]). This legacy entry point infers
+/// only the counter-clockwise turn, from most items sitting at negative y;
+/// a clockwise turn is never inferred, because content drawn at negative
+/// page x looks the same. Pass the page's frame explicitly with
+/// [`collect_text_in_region_in_frame`] (frames come from
+/// [`extract_text_with_positions_and_rotations_mem`]), or use
+/// [`extract_text_in_regions_mem`], which handles both turns itself.
 pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
@@ -3474,6 +3752,32 @@ pub fn collect_text_in_region(
         ry2,
         page_height,
         infer_region_coord_space(items),
+        0.10,
+    )
+}
+
+/// [`collect_text_in_region`] with the page's coordinate frame given
+/// explicitly instead of inferred: `rotation` is the turn
+/// [`extract_text_with_positions_and_rotations_mem`] reported for the items'
+/// page (`PageRotation::Upright` for pages absent from that map). The region
+/// bbox stays in top-left page coordinates and is turned to match.
+pub fn collect_text_in_region_in_frame(
+    items: &[TextItem],
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+    rotation: PageRotation,
+) -> String {
+    collect_text_in_region_with_options(
+        items,
+        rx1,
+        ry1,
+        rx2,
+        ry2,
+        page_height,
+        RegionCoordSpace::from(rotation),
         0.10,
     )
 }
@@ -3526,21 +3830,25 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 
     // Simple extraction: the caller (fire-pdf) already handles reading order
     // and column splitting via the layout model. We just need to sort items
-    // top-to-bottom, left-to-right and group into lines.
+    // top-to-bottom, left-to-right and group into lines. Baselines go
+    // through `line_y`, which snaps super/subscript glyph runs onto the body
+    // baseline they are attached to: sorting raw `y` put every raised
+    // affiliation marker of an author line ahead of the names, and the 3pt
+    // window then emitted them as an orphan ",2,3,2,4,*" line.
     let mut sorted = matched;
-    sorted.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
 
     let y_tolerance = 3.0;
     let mut lines: Vec<extractor::TextLine> = Vec::new();
 
     for item in sorted {
         let should_merge = lines.last().is_some_and(|last_line: &extractor::TextLine| {
-            last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
+            last_line.page == item.page && (last_line.y - item.line_y()).abs() < y_tolerance
         });
         if should_merge {
             lines.last_mut().unwrap().items.push(item);
         } else {
-            let y = item.y;
+            let y = item.line_y();
             let page = item.page;
             lines.push(extractor::TextLine {
                 items: vec![item],
@@ -3564,9 +3872,18 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 }
 
 fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
-    // Rotated-page normalization currently maps y = -old_x, so most text items
-    // land at negative Y. Use this to keep `collect_text_in_region` behavior
-    // compatible for direct callers that do not have extractor metadata.
+    // Rotated-page correction negates one axis: a counter-clockwise turn
+    // maps y = -(old right edge), a clockwise turn maps x = -(old top edge),
+    // so most items land at negative y or negative x respectively. Use this
+    // to keep `collect_text_in_region` behavior compatible for direct
+    // callers that do not have extractor metadata.
+    // Legacy heuristic for callers without extractor metadata: a
+    // counter-clockwise turn maps y = -(old right edge), so most items land
+    // at negative y (the pre-existing rule, kept as is). A clockwise turn is
+    // never inferred — its signature (negative x) cannot be told apart from
+    // content drawn at negative page coordinates. Callers pass the frame
+    // explicitly through `collect_text_in_region_in_frame` or use
+    // `extract_text_in_regions_mem`, which carries the page rotation itself.
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
     if !items.is_empty() && negative_y * 2 >= items.len() {
         RegionCoordSpace::Rotated90Ccw
@@ -3575,6 +3892,9 @@ fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
     }
 }
 
+/// Convert a top-left-origin region into bounds in the item frame.
+/// `page_height` is the visible page box height: items were shifted into
+/// that box, so flipping `y` by its height lands regions on them.
 fn region_bounds(
     rx1: f32,
     ry1: f32,
@@ -3602,6 +3922,12 @@ fn region_bounds(
             y_min: -tx_max,
             y_max: -tx_min,
         },
+        RegionCoordSpace::Rotated90Cw => RegionBounds {
+            x_min: -by_max,
+            x_max: -by_min,
+            y_min: tx_min,
+            y_max: tx_max,
+        },
     }
 }
 
@@ -3614,7 +3940,7 @@ const REGION_MARGIN: f32 = 1.5;
 /// boolean test) — the exclusive-assignment score.
 fn region_item_overlap_area(item: &TextItem, bounds: RegionBounds) -> f32 {
     let item_x_max = item.x + text_utils::effective_width(item);
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
     let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
         - item.x.max(bounds.x_min - REGION_MARGIN))
     .max(0.0);
@@ -3628,7 +3954,7 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
     let item_x_min = item.x;
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_min = item.y;
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
 
     let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
         - item_x_min.max(bounds.x_min - REGION_MARGIN))
@@ -3680,7 +4006,7 @@ fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
     let item_x_min = item.x;
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_min = item.y;
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
 
     let center_x = (item_x_min + item_x_max) * 0.5;
     let center_y = (item_y_min + item_y_max) * 0.5;
@@ -3763,8 +4089,7 @@ fn load_document_from_mem_with_password_and_limit(
                 match load_document_bytes(&repaired, password, max_decompressed_size) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
-                        let page_count = doc.get_pages().len() as u32;
-                        return Ok((doc, page_count));
+                        return finish_loaded_document(doc);
                     }
                     Err(error) => {
                         if is_encrypted_lopdf_error(&error) {
@@ -3776,8 +4101,58 @@ fn load_document_from_mem_with_password_and_limit(
             return Err(first_err.into());
         }
     };
+    finish_loaded_document(doc)
+}
+
+/// A loaded document with zero pages is unusable by every caller, and with
+/// the decompression bound in place it can also mean the page tree lived in
+/// an object stream lopdf skipped for exceeding the bound. Fail the load
+/// either way rather than letting a pageless document masquerade as a
+/// successful parse.
+fn finish_loaded_document(doc: Document) -> Result<(Document, u32), PdfError> {
     let page_count = doc.get_pages().len() as u32;
+    if page_count == 0 {
+        return Err(PdfError::Parse(
+            "document has no readable pages".to_string(),
+        ));
+    }
+    // lopdf drops the contents of object streams it could not expand (over
+    // the decompression bound, or unparseable) without any signal on the
+    // returned document. The only trace either loader path leaves is a
+    // deficit between the xref size (`max_id`) and the objects actually
+    // loaded — which free xref entries also contribute to, so this is a
+    // heuristic: surface large deficits for diagnosability, worded so a
+    // legitimately sparse xref isn't reported as data loss. The document is
+    // still usable either way; unloaded objects resolve as not-found.
+    let expected = doc.max_id as usize;
+    let loaded = doc.objects.len();
+    let missing = expected.saturating_sub(loaded);
+    if missing > 1000 && missing.saturating_mul(64) > expected {
+        log::warn!(
+            "loaded {loaded} of {expected} xref object slots; the rest are free \
+             xref entries or object streams skipped over the \
+             {MAX_STREAM_DECOMPRESSED_BYTES}-byte decompression bound, and will \
+             resolve as not-found"
+        );
+    }
     Ok((doc, page_count))
+}
+
+/// Per-stream decompression budget applied while loading (object streams and
+/// xref streams). Some tagged PDFs pack their structure tree into object
+/// streams that inflate to hundreds of MB each from a ~20MB file; lopdf
+/// materializes every object stream eagerly at load, so without a bound one
+/// such document exhausts memory before any of our code runs. lopdf skips an
+/// object stream that would exceed the bound (its objects resolve as
+/// not-found), which the zero-page check in `load_document_from_mem_with_password`
+/// turns into a load error instead of a silently wrong answer.
+const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+
+fn bounded_load_options(max_decompressed_size: Option<usize>) -> lopdf::LoadOptions {
+    lopdf::LoadOptions {
+        max_decompressed_size: max_decompressed_size.or(Some(MAX_STREAM_DECOMPRESSED_BYTES)),
+        ..Default::default()
+    }
 }
 
 fn load_document_bytes(
@@ -3785,13 +4160,7 @@ fn load_document_bytes(
     password: Option<&str>,
     max_decompressed_size: Option<usize>,
 ) -> Result<Document, lopdf::Error> {
-    match Document::load_mem_with_options(
-        buf,
-        lopdf::LoadOptions {
-            max_decompressed_size,
-            ..Default::default()
-        },
-    ) {
+    match Document::load_mem_with_options(buf, bounded_load_options(max_decompressed_size)) {
         // Some encrypted PDFs load structurally but leave their streams
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
@@ -3815,20 +4184,16 @@ fn decrypt_document_bytes(
     password: Option<&str>,
     max_decompressed_size: Option<usize>,
 ) -> Result<Document, lopdf::Error> {
-    let load_with_password = |password: &str| {
-        Document::load_mem_with_options(
-            buf,
-            lopdf::LoadOptions {
-                password: Some(password.to_owned()),
-                max_decompressed_size,
-                ..Default::default()
-            },
-        )
+    let pw = password.unwrap_or("");
+    let with_password = |pw: &str| lopdf::LoadOptions {
+        password: Some(pw.to_string()),
+        ..bounded_load_options(max_decompressed_size)
     };
-    let password = password.unwrap_or("");
-    match load_with_password(password) {
+    match Document::load_mem_with_options(buf, with_password(pw)) {
         Ok(doc) => Ok(doc),
-        Err(inner) if !password.is_empty() => load_with_password("").map_err(|_| inner),
+        Err(inner) if !pw.is_empty() => {
+            Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)
+        }
         Err(inner) => Err(inner),
     }
 }
@@ -3838,6 +4203,11 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
     add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
+    add_repair_candidate(
+        &mut candidates,
+        xref_repair::rebuild_short_xref_entries(buf),
+        buf,
+    );
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
@@ -3850,6 +4220,11 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
         add_repair_candidate(
             &mut candidates,
             recover_startxref_pointer(stripped_buf),
+            buf,
+        );
+        add_repair_candidate(
+            &mut candidates,
+            xref_repair::rebuild_short_xref_entries(stripped_buf),
             buf,
         );
     }
@@ -4910,14 +5285,19 @@ mod text_cluster_column_undercount_tests {
             width: text.len() as f32 * 5.0,
             height: 10.0,
             font: "F".into(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -5186,14 +5566,19 @@ mod table_candidate_selection_tests {
             width: 50.0,
             height: 10.0,
             font: "F1".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -6027,14 +6412,19 @@ mod tests {
             width,
             height,
             font: "Helvetica".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: height,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -6043,6 +6433,36 @@ mod tests {
             page,
             ..test_item(text, 10.0, 10.0, text.len() as f32 * 5.0, 12.0)
         }
+    }
+
+    fn test_image_item(width: f32, height: f32) -> TextItem {
+        TextItem {
+            item_type: ItemType::Image,
+            ..test_item("[Image]", 20.0, 30.0, width, height)
+        }
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_require_substantial_physical_images() {
+        let substantial = supplemental_ocr_image_region(&test_image_item(200.0, 120.0)).unwrap();
+        assert_eq!(substantial.width, 200.0);
+        assert_eq!(substantial.height, 120.0);
+
+        assert!(supplemental_ocr_image_region(&test_image_item(100.0, 200.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(200.0, 60.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(120.0, 100.0)).is_none());
+        assert!(
+            supplemental_ocr_image_region(&test_item("text", 0.0, 0.0, 300.0, 300.0)).is_none()
+        );
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_normalize_negative_image_dimensions() {
+        let region = supplemental_ocr_image_region(&test_image_item(-200.0, -120.0)).unwrap();
+        assert_eq!(region.x, -180.0);
+        assert_eq!(region.y, -90.0);
+        assert_eq!(region.width, 200.0);
+        assert_eq!(region.height, 120.0);
     }
 
     #[test]
@@ -7185,5 +7605,214 @@ mod tests {
     fn recover_startxref_pointer_returns_none_without_a_valid_table() {
         let buf = b"Please refer to the xref appendix for details.";
         assert!(recover_startxref_pointer(buf).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rotated_run_region_tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn item(text: &str, x: f32, y: f32, width: f32, height: f32, rotation: f32) -> TextItem {
+        TextItem {
+            baseline_shift: 0.0,
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            rotation,
+            advance_known: true,
+            font: "Helvetica".to_string(),
+            font_tag: "F1".to_string(),
+            legacy_symbol_rewrite: false,
+            font_size: if rotation == 0.0 { height } else { width },
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    const STAMP: &str = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023";
+
+    #[test]
+    fn vertical_margin_run_overlaps_only_the_margin_region() {
+        // Letter page; region boxes are top-left page coordinates as the
+        // layout model reports them: a left-margin strip and the body area.
+        let page_h = 792.0;
+        let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
+        let body = region_bounds(60.0, 0.0, 612.0, 792.0, page_h, RegionCoordSpace::Standard);
+
+        let stamp = item(STAMP, 12.0, 200.0, 20.0, 400.0, 90.0);
+        assert!(region_overlaps_item(&stamp, margin));
+        assert!(!region_overlaps_item(&stamp, body));
+        assert!(region_item_overlap_area(&stamp, margin) > 0.0);
+        assert_eq!(region_item_overlap_area(&stamp, body), 0.0);
+    }
+
+    #[test]
+    fn collect_text_in_region_finds_the_vertical_run_by_its_box() {
+        let items = vec![
+            item(STAMP, 12.0, 200.0, 20.0, 400.0, 90.0),
+            item("Body text", 72.0, 500.0, 50.0, 11.0, 0.0),
+        ];
+        assert_eq!(
+            collect_text_in_region(&items, 0.0, 0.0, 50.0, 792.0, 792.0),
+            STAMP
+        );
+        assert_eq!(
+            collect_text_in_region(&items, 60.0, 0.0, 612.0, 792.0, 792.0),
+            "Body text"
+        );
+    }
+
+    #[test]
+    fn clockwise_frame_region_bounds_follow_the_turned_page() {
+        // A 270° header along the right margin of a Letter page: page box
+        // x ∈ [580, 590], y ∈ [664, 700]. In the clockwise-turned frame it
+        // sits at x = -(top), y = baseline x.
+        let page_h = 792.0;
+        let header = item("HEADER", -700.0, 580.0, 36.0, 10.0, 0.0);
+        // Top-left region boxes: a strip around the header and the body.
+        let strip = region_bounds(
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            RegionCoordSpace::Rotated90Cw,
+        );
+        let body = region_bounds(
+            60.0,
+            80.0,
+            500.0,
+            700.0,
+            page_h,
+            RegionCoordSpace::Rotated90Cw,
+        );
+        assert!(region_overlaps_item(&header, strip));
+        assert!(!region_overlaps_item(&header, body));
+
+        // The legacy heuristic recognises only the counter-clockwise frame
+        // (most items at negative y); a clockwise frame is never inferred and
+        // must be passed explicitly.
+        assert_eq!(
+            infer_region_coord_space(&[header.clone()]),
+            RegionCoordSpace::Standard
+        );
+        assert_eq!(
+            infer_region_coord_space(&[item("x", 100.0, -200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Rotated90Ccw
+        );
+        assert_eq!(
+            infer_region_coord_space(&[item("x", 100.0, 200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Standard
+        );
+        let strip = collect_text_in_region_in_frame(
+            &[header.clone()],
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            PageRotation::Cw,
+        );
+        assert_eq!(strip, "HEADER");
+        let misread = collect_text_in_region_in_frame(
+            &[header.clone()],
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            PageRotation::Upright,
+        );
+        assert_eq!(misread, "");
+
+        // Bounds round-trip back to the top-left page box they came from.
+        for coords in [
+            RegionCoordSpace::Standard,
+            RegionCoordSpace::Rotated90Ccw,
+            RegionCoordSpace::Rotated90Cw,
+        ] {
+            let b = region_bounds(570.0, 80.0, 600.0, 140.0, page_h, coords);
+            let back = extracted_bbox_to_page_top_left(
+                [b.x_min, b.y_min, b.x_max, b.y_max],
+                page_h,
+                coords,
+            );
+            assert_eq!(back, [570.0, 80.0, 600.0, 140.0], "{coords:?}");
+        }
+    }
+
+    #[test]
+    fn tsr_line_clustering_uses_the_estimated_height_of_unknown_advances() {
+        let estimated = STAMP.chars().count() as f32 * 0.5 * 20.0;
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, estimated, 90.0);
+        stamp.advance_known = false;
+        let lines = cluster_tsr_cell_text_lines(vec![stamp]);
+        assert_eq!(lines.len(), 1);
+        // Half the estimated extent, not the 2.5pt floor.
+        assert!(
+            (lines[0].half_height - estimated * 0.5).abs() < 1e-3,
+            "{}",
+            lines[0].half_height
+        );
+    }
+
+    #[test]
+    fn vertical_run_without_font_widths_still_overlaps_its_region() {
+        // No width information: the advance is unknown, so the run's box is
+        // one em wide and zero tall. The estimated height must keep it
+        // matchable instead of letting it vanish from region extraction.
+        let page_h = 792.0;
+        let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
+        // Extraction lays a half-em-per-glyph estimate along the run for a
+        // width-less font and flags it (the content-stream tests cover the
+        // parser side); region matching sees that box like any other.
+        let estimated = STAMP.chars().count() as f32 * 0.5 * 20.0;
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, estimated, 90.0);
+        stamp.advance_known = false;
+        assert!(region_overlaps_item(&stamp, margin));
+        assert!(region_item_overlap_area(&stamp, margin) > 0.0);
+        assert!(tsr_region_contains_item(&stamp, margin));
+    }
+
+    #[test]
+    fn token_splitting_leaves_rotated_runs_whole() {
+        let stamp = item("two words", 12.0, 200.0, 20.0, 100.0, 90.0);
+        let tokens = split_item_into_token_subitems(&stamp);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "two words");
+        assert_eq!((tokens[0].x, tokens[0].width), (12.0, 20.0));
+
+        // Upside-down runs advance towards -x: interpolating from the left
+        // edge would swap the tokens' cells.
+        let flipped = item("two words", 72.0, 500.0, 90.0, 10.0, 180.0);
+        assert_eq!(split_item_into_token_subitems(&flipped).len(), 1);
+
+        let body = item("two words", 72.0, 500.0, 90.0, 10.0, 0.0);
+        assert_eq!(split_item_into_token_subitems(&body).len(), 2);
+    }
+
+    #[test]
+    fn token_splitting_spreads_only_an_unknown_zero_width_run() {
+        // A known zero advance (an ActualText replacement that painted
+        // nothing) keeps its tokens where the run was drawn; a run whose
+        // advance is unknown is spread over half an em per character.
+        let zero = item("two words", 72.0, 500.0, 0.0, 10.0, 0.0);
+        let tokens = split_item_into_token_subitems(&zero);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!((tokens[0].x, tokens[1].x), (72.0, 72.0));
+
+        let mut unknown = zero;
+        unknown.advance_known = false;
+        let tokens = split_item_into_token_subitems(&unknown);
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens[1].x > tokens[0].x + 15.0, "{tokens:?}");
     }
 }

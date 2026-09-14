@@ -9,6 +9,7 @@
 pub(crate) mod analysis;
 mod classify;
 mod convert;
+mod furniture;
 mod heading;
 mod postprocess;
 mod preprocess;
@@ -53,7 +54,7 @@ fn is_chart_adjacent_label(item: &TextItem, region: (f32, f32, f32, f32)) -> boo
         0.0
     };
     let is_caption = is_caption_line(text);
-    let em = item.height.max(item.font_size).max(1.0);
+    let em = item.cross_extent().max(item.font_size).max(1.0);
     let compact_label = item_width <= em * 18.5;
     let category_band = (em * 1.85).clamp(6.0, CHART_REGION_PAD);
     let close_to_chart_edge = if is_caption {
@@ -453,13 +454,117 @@ fn merged_retry_skips_body_font(detected_columns: bool, has_chart_regions: bool)
     detected_columns && !has_chart_regions
 }
 
+/// Identity of a piece of page furniture: the same trimmed text drawn at the
+/// same position (quantized to 0.5pt) — page numbers excluded by construction
+/// because their text differs per page.
+type FurnitureKey = (String, i32, i32);
+
+fn furniture_key(item: &TextItem) -> FurnitureKey {
+    (
+        item.text.trim().to_string(),
+        (item.x * 2.0).round() as i32,
+        (item.y * 2.0).round() as i32,
+    )
+}
+
+/// Minimum distinct pages an identical (text, position) must appear on before
+/// it counts as a running header/footer rather than coincidence.
+const RUNNING_FURNITURE_MIN_PAGES: usize = 3;
+
+/// Fraction of each page's vertical content extent, at the top and at the
+/// bottom, where running furniture may live. Repetition alone is not enough:
+/// a form template repeated per record carries identical labels at identical
+/// mid-page coordinates on every page, and those are real table cells. What
+/// makes a header/footer is repetition *at the page edge*.
+const RUNNING_FURNITURE_BAND: f32 = 0.2;
+
+/// Collect the keys of items that repeat verbatim at the same position on at
+/// least [`RUNNING_FURNITURE_MIN_PAGES`] distinct pages, restricted to the
+/// top/bottom [`RUNNING_FURNITURE_BAND`] of each page's content extent —
+/// running headers and footers. Single- and two-page documents produce an
+/// empty set.
+fn running_furniture_keys(items: &[TextItem]) -> HashSet<FurnitureKey> {
+    // Vertical content extent per page, so the edge bands adapt to the
+    // document's real margins instead of assuming a media box.
+    let mut page_extent: HashMap<u32, (f32, f32)> = HashMap::new();
+    for item in items {
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        let entry = page_extent.entry(item.page).or_insert((item.y, item.y));
+        entry.0 = entry.0.min(item.y);
+        entry.1 = entry.1.max(item.y);
+    }
+
+    let mut pages_by_key: HashMap<FurnitureKey, HashSet<u32>> = HashMap::new();
+    for item in items {
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        let Some(&(min_y, max_y)) = page_extent.get(&item.page) else {
+            continue;
+        };
+        // A page whose text has no vertical span gives no evidence of where
+        // its edges are — without this guard, a zero band would classify its
+        // every item as edge furniture.
+        let extent = max_y - min_y;
+        if extent <= 0.0 {
+            continue;
+        }
+        let band = extent * RUNNING_FURNITURE_BAND;
+        if item.y > min_y + band && item.y < max_y - band {
+            continue; // mid-page: never furniture, however often it repeats
+        }
+        pages_by_key
+            .entry(furniture_key(item))
+            .or_default()
+            .insert(item.page);
+    }
+    pages_by_key
+        .into_iter()
+        .filter(|(_, pages)| pages.len() >= RUNNING_FURNITURE_MIN_PAGES)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Reject a heuristic table whose items are almost entirely running
+/// headers/footers. A wrapped document title repeated at the bottom of every
+/// page aligns well enough to read as a grid, but it is page furniture, not
+/// data — vetoing the table lets the text flow as prose instead. Real tables
+/// carry per-page content, so even a repeated *header row* stays under the
+/// threshold once its body rows differ.
+fn is_running_furniture_table(
+    detection_items: &[TextItem],
+    table: &crate::tables::Table,
+    running: &HashSet<FurnitureKey>,
+) -> bool {
+    if running.is_empty() {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut furniture = 0usize;
+    for &idx in &table.item_indices {
+        let Some(item) = detection_items.get(idx) else {
+            continue;
+        };
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        if running.contains(&furniture_key(item)) {
+            furniture += 1;
+        }
+    }
+    total > 0 && (furniture as f32) >= (total as f32) * 0.8
+}
+
 /// Reject a heuristic table only when its cells are overwhelmingly parallel
 /// prose fragments. This is deliberately narrower than disabling body-font
 /// detection for the whole page: numeric, compact, headed, and otherwise
 /// table-shaped candidates remain eligible on chart pages.
 fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     if table.kind != crate::tables::TableKind::Data
-        || !(2..=3).contains(&table.columns.len())
+        || !(2..=6).contains(&table.columns.len())
         || table.rows.len() < 3
     {
         return false;
@@ -517,20 +622,127 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     // direct physical-row transition from an unterminated cell in the same
     // column. This is the shape produced when independent prose columns are
     // accidentally projected onto one table grid.
+    // Prose flowing through a grid is often interrupted by empty cells
+    // (the interleaved fragment occupies the other column on that row), so
+    // each cell is compared against the last non-empty cell above it in the
+    // same column, not just the immediately preceding row.
     let mut continuation_fragments = 0;
     let mut continuation_columns = vec![false; table.columns.len()];
-    for rows in table.cells.windows(2) {
-        for (column, has_continuation) in continuation_columns.iter_mut().enumerate() {
-            let previous = rows[0].get(column).map(String::as_str).unwrap_or("");
-            let current = rows[1].get(column).map(String::as_str).unwrap_or("");
-            if is_cross_row_prose_continuation(previous, current) {
-                continuation_fragments += 1;
-                *has_continuation = true;
+    for (column, has_continuation) in continuation_columns.iter_mut().enumerate() {
+        let mut previous_non_empty: Option<&str> = None;
+        for row in &table.cells {
+            let current = row.get(column).map(String::as_str).unwrap_or("");
+            if current.trim().is_empty() {
+                continue;
             }
+            if let Some(previous) = previous_non_empty {
+                if is_cross_row_prose_continuation(previous, current) {
+                    continuation_fragments += 1;
+                    *has_continuation = true;
+                }
+            }
+            previous_non_empty = Some(current);
         }
     }
 
-    let is_parallel = !has_compact_header
+    // A compact header row is evidence for a real table — unless cross-row
+    // prose continuations outnumber the rows, which no genuine table
+    // produces: the "header" is then just two short line fragments at the
+    // top of parallel prose columns.
+    let header_blocks = has_compact_header && continuation_fragments <= table.cells.len();
+
+    // Citation blocks over-fragmented into wide grids: nearly every cell is
+    // a bare word and the rows read on as prose. Real wide tables carry
+    // numbers, units, or multi-word values.
+    let single_token_alpha = table
+        .cells
+        .iter()
+        .flatten()
+        .filter(|cell| {
+            let t = cell.trim();
+            !t.is_empty()
+                && t.split_whitespace().count() == 1
+                && t.chars().filter(|c| c.is_alphabetic()).count() * 2 >= t.chars().count().max(1)
+        })
+        .count();
+    // Categorical grids repeat a small value vocabulary down their
+    // columns; flowing text almost never repeats a cell. A fully
+    // populated word grid is only rejected when its cells are almost all
+    // distinct AND the continuations strongly outnumber the rows.
+    let distinct_cells: std::collections::HashSet<String> = table
+        .cells
+        .iter()
+        .flatten()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mostly_distinct = distinct_cells.len() * 4 >= non_empty * 3;
+    let word_fragment_grid = !header_blocks
+        && table.columns.len() >= 4
+        && non_empty >= 8
+        && (non_empty < table.cells.len() * table.columns.len()
+            || (mostly_distinct && continuation_fragments > table.cells.len() * 2))
+        && single_token_alpha * 4 >= non_empty * 3
+        && continuation_fragments >= 4
+        && continuation_columns.iter().filter(|&&value| value).count() >= 2;
+
+    // Numbered lists projected onto a two-column grid: the first column is
+    // list markers ("1.", "2)", …), the second the item text. Rendering
+    // these as tables loses the list; the page flow keeps it.
+    // A leading "1. | <text>" row is the list's own first item, not a
+    // table header — but only when the whole first column actually has
+    // the list shape (mostly ordinal markers); a lone punctuation-styled
+    // rank must not disable the compact-header protection.
+    let is_ordinal_marker = |cell: &str| {
+        let t = cell.trim();
+        t.len() <= 4
+            && t.ends_with(['.', ')'])
+            && !t[..t.len() - 1].is_empty()
+            && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+    };
+    let first_column_list_shape = {
+        let mut markers = 0usize;
+        let mut filled = 0usize;
+        for row in &table.cells {
+            let first = row.first().map(|s| s.trim()).unwrap_or("");
+            if first.is_empty() {
+                continue;
+            }
+            filled += 1;
+            if is_ordinal_marker(first)
+                || first
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(is_ordinal_marker)
+            {
+                markers += 1;
+            }
+        }
+        filled >= 4 && markers * 10 >= filled * 7
+    };
+    let ordinal_header_blocks = header_blocks && !first_column_list_shape;
+    let ordinal_list =
+        !ordinal_header_blocks && table.columns.len() == 2 && table.cells.len() >= 4 && {
+            let mut markers = 0;
+            let mut filled_first = 0;
+            for row in &table.cells {
+                let first = row.first().map(|s| s.trim()).unwrap_or("");
+                if first.is_empty() {
+                    continue;
+                }
+                filled_first += 1;
+                let is_marker = first.len() <= 4
+                    && first.ends_with(['.', ')'])
+                    && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit())
+                    && !first[..first.len() - 1].is_empty();
+                if is_marker {
+                    markers += 1;
+                }
+            }
+            filled_first >= 4 && markers * 10 >= filled_first * 7
+        };
+
+    let is_parallel = !header_blocks
         && non_empty >= 5
         // Independent prose columns have asynchronous line/paragraph breaks;
         // a fully populated grid is positive evidence for a real descriptive
@@ -547,6 +759,72 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
             || (rows_with_parallel_prose >= 1 && has_numbered_section_heading))
         && continuation_fragments >= 3
         && continuation_columns.iter().filter(|&&value| value).count() >= 2;
+    let not_fully_populated = non_empty < table.cells.len() * table.columns.len();
+    // Small 2-column weaves rarely accumulate 3 cross-row continuations —
+    // there aren't enough rows — but long prose in both columns plus a
+    // continuation in each is already the projection signature.
+    let tiny_grid_weave = !header_blocks
+        && table.cells.len() <= 4
+        && not_fully_populated
+        && long_prose >= 4
+        && continuation_fragments >= 2
+        && continuation_columns.iter().filter(|&&value| value).count() >= 2;
+    // Wide multi-column projections of page text: continuations outnumber
+    // the rows and appear in 3+ columns. Genuine wide tables wrap inside
+    // one or two description columns; they never flow everywhere at once.
+    // Long prose cells are required: reference tables whose wrapped
+    // entries continue in every column (short citation fragments) look
+    // continuation-dominated too, but they never read as running text.
+    let continuation_dominated = !header_blocks
+        && not_fully_populated
+        && long_prose >= 4
+        // ...and long prose must be a real share of the grid: a large data
+        // table with a handful of wordy cells and many wrapped-cell
+        // continuations is not a weave.
+        && long_prose * 10 >= non_empty
+        // Continuations must strictly outnumber the rows (with an absolute
+        // floor), preserving the compact-header rule's spirit for every
+        // rejection branch.
+        && continuation_fragments > table.cells.len().max(7)
+        && continuation_columns.iter().filter(|&&value| value).count() >= 3;
+    // Numbered list items ("1. Restructuring ...") woven beside sidebar
+    // fragments: the first column is a monotone ordinal-prefixed list.
+    let ordinal_prefix_list =
+        !ordinal_header_blocks && table.columns.len() == 2 && table.cells.len() >= 4 && {
+            let mut values: Vec<u32> = Vec::new();
+            let mut filled_first = 0;
+            for row in &table.cells {
+                let first = row.first().map(|s| s.trim()).unwrap_or("");
+                if first.is_empty() {
+                    continue;
+                }
+                filled_first += 1;
+                let mut parts = first.splitn(2, char::is_whitespace);
+                let marker = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("").trim();
+                if marker.len() <= 4
+                    && marker.ends_with(['.', ')'])
+                    && marker[..marker.len() - 1]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                    && !marker[..marker.len() - 1].is_empty()
+                    && rest.split_whitespace().count() >= 2
+                {
+                    if let Ok(v) = marker[..marker.len() - 1].parse() {
+                        values.push(v);
+                    }
+                }
+            }
+            filled_first >= 4
+                && values.len() * 10 >= filled_first * 7
+                && values.windows(2).all(|w| w[1] >= w[0])
+        };
+    let is_parallel = is_parallel
+        || word_fragment_grid
+        || ordinal_list
+        || ordinal_prefix_list
+        || tiny_grid_weave
+        || continuation_dominated;
     log::debug!(
         "chart table hypothesis: {}x{}, non_empty={}, long_prose={}, parallel_rows={}/{}, section_heading={}, continuation_fragments={}, continuation_columns={}, reject={}",
         table.rows.len(),
@@ -563,16 +841,78 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
     is_parallel
 }
 
-fn positioned_table(
-    table: &crate::tables::Table,
-    chart_order: Option<ChartProseOrder>,
-) -> PositionedMarkdown {
-    PositionedMarkdown::new(
-        table.rows.first().copied().unwrap_or(0.0),
-        table.columns.first().copied().unwrap_or(0.0),
-        crate::tables::table_to_markdown(table),
-        chart_order,
-    )
+#[derive(Clone, Copy)]
+enum TableOutputMode {
+    Markdown,
+    #[cfg(feature = "ocr")]
+    CompleteTables,
+}
+
+struct TableDetectionOutput {
+    mode: TableOutputMode,
+    pages_with_detected_tables: HashSet<u32>,
+    pages_with_tables: HashSet<u32>,
+    markdown_by_page: HashMap<u32, Vec<PositionedMarkdown>>,
+    #[cfg(feature = "ocr")]
+    complete_tables: Vec<(u32, crate::tables::Table)>,
+}
+
+impl TableDetectionOutput {
+    fn new(mode: TableOutputMode) -> Self {
+        Self {
+            mode,
+            pages_with_detected_tables: HashSet::new(),
+            pages_with_tables: HashSet::new(),
+            markdown_by_page: HashMap::new(),
+            #[cfg(feature = "ocr")]
+            complete_tables: Vec::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        page: u32,
+        table: &crate::tables::Table,
+        chart_order: Option<ChartProseOrder>,
+    ) {
+        self.pages_with_detected_tables.insert(page);
+        match self.mode {
+            TableOutputMode::Markdown => {
+                self.pages_with_tables.insert(page);
+                self.markdown_by_page
+                    .entry(page)
+                    .or_default()
+                    .push(PositionedMarkdown::new(
+                        table.rows.first().copied().unwrap_or(0.0),
+                        table.columns.first().copied().unwrap_or(0.0),
+                        crate::tables::table_to_markdown(table),
+                        chart_order,
+                    ));
+            }
+            #[cfg(feature = "ocr")]
+            TableOutputMode::CompleteTables => {
+                if crate::tables::is_complete_data_table(table) {
+                    self.pages_with_tables.insert(page);
+                    self.complete_tables.push((page, table.clone()));
+                }
+            }
+        }
+    }
+
+    fn has_tables_on_page(&self, page: u32) -> bool {
+        self.pages_with_tables.contains(&page)
+    }
+
+    fn has_detected_tables_on_page(&self, page: u32) -> bool {
+        self.pages_with_detected_tables.contains(&page)
+    }
+}
+
+#[derive(Default)]
+struct MarkdownConversionOutput {
+    markdown: String,
+    #[cfg(feature = "ocr")]
+    detected_tables: Vec<(u32, crate::tables::Table)>,
 }
 
 /// Derive a side-by-side split from rect hint regions.
@@ -1040,6 +1380,14 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
     output
 }
 
+/// Applies the document-wide repeated header/footer classifier to grouped lines.
+pub(crate) fn strip_repeated_header_footer_lines(
+    lines: Vec<crate::types::TextLine>,
+    page_count: u32,
+) -> Vec<crate::types::TextLine> {
+    furniture::strip_header_footer_lines(lines, page_count)
+}
+
 /// Convert positioned text items to markdown with structure detection
 pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) -> String {
     to_markdown_from_items_with_rects(items, options, &[])
@@ -1113,6 +1461,64 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
 ) -> String {
+    convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown,
+    )
+    .markdown
+}
+
+/// Run the ordinary Markdown table pipeline but return only structurally
+/// complete data tables. Supplemental OCR uses this to keep detector behavior
+/// identical without parsing the serialized Markdown back into tables.
+#[cfg(feature = "ocr")]
+pub(crate) fn complete_table_markdown_from_items(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    document_page_count: u32,
+) -> String {
+    let conversion = convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        &[],
+        &[],
+        MarkdownDocumentContext {
+            page_thresholds: &HashMap::new(),
+            struct_roles: None,
+            struct_tables: &[],
+            page_count: document_page_count,
+            prefiltered_page_number_pages: None,
+            prefiltered_page_number_mask: None,
+            precomputed_chart_regions: None,
+        },
+        TableOutputMode::CompleteTables,
+    );
+    let mut output = String::new();
+    for (_, table) in conversion.detected_tables {
+        let markdown = crate::tables::table_to_markdown(&table);
+        if markdown.is_empty() {
+            continue;
+        }
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        output.push_str(&markdown);
+    }
+    output
+}
+
+fn convert_items_with_rects_lines_and_table_output(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+    table_output_mode: TableOutputMode,
+) -> MarkdownConversionOutput {
     use crate::tables::{
         content_width, detect_tables_from_lines, detect_tables_from_rects,
         detect_tables_from_struct_tree, detect_tables_with_page_width, try_build_rect_guided_table,
@@ -1130,7 +1536,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     } = context;
 
     if items.is_empty() {
-        return String::new();
+        return MarkdownConversionOutput::default();
     }
 
     // Table detection must retain the original collection because short
@@ -1186,7 +1592,13 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Detect tables on each page
     let mut table_items: HashSet<usize> = HashSet::new();
-    let mut page_tables: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+    let mut table_output = TableDetectionOutput::new(table_output_mode);
+
+    // Running headers/footers repeat verbatim at the same position on many
+    // pages. When such a block wraps a long title over aligned lines, the
+    // heuristic detector reads it as a table. Knowing which items are page
+    // furniture is a document-wide question, so answer it once here.
+    let running_furniture = running_furniture_keys(&text_items);
 
     // Pre-group items by page with their global indices (O(n) instead of O(pages*n))
     let mut page_groups: HashMap<u32, Vec<(usize, &TextItem)>> = HashMap::new();
@@ -1256,7 +1668,6 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             chart_page_prose_column_split(&page_layout_items)
                 .filter(|&split_x| chart_spans_prose_split(region, split_x))
         });
-        let chart_prose_columns = chart_prose_split.is_some();
 
         // Check for side-by-side table layout using the original items. Sparse
         // numeric cells need table context before they can be distinguished
@@ -1396,10 +1807,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(table, chart_prose_order));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
 
@@ -1423,10 +1831,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                 }
-                page_tables
-                    .entry(page)
-                    .or_default()
-                    .push(positioned_table(table, chart_prose_order));
+                table_output.record(page, table, chart_prose_order);
             }
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
@@ -1441,10 +1846,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(table, chart_prose_order));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
 
@@ -1480,10 +1882,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        page_tables
-                            .entry(page)
-                            .or_default()
-                            .push(positioned_table(&table, chart_prose_order));
+                        table_output.record(page, &table, chart_prose_order);
                         for &band_idx in &inside_map {
                             rect_claimed.insert(band_idx);
                         }
@@ -1497,10 +1896,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     if subset_items.len() < min_items {
                         return;
                     }
-                    // Keep body-font detection available on chart pages: a real
-                    // table can share the prose anchors. Reject only candidates
-                    // whose cells prove they are parallel prose fragments.
-                    let reject_parallel_prose = chart_prose_columns && !was_split;
+                    // Reject candidates whose cells prove they are parallel
+                    // prose fragments — the shape produced when the body-font
+                    // pass projects a multi-column text page onto one table
+                    // grid (two-column reference sections are the classic
+                    // case). The check needs internal transition evidence
+                    // (unterminated cells flowing into lowercase starts in
+                    // the same column), so genuine tables with long cells
+                    // pass. Band-split retries stay exempt: they exist for
+                    // tables that only assemble after recombining bands.
+                    let reject_parallel_prose = !was_split;
                     let tables = detect_tables_with_page_width(
                         subset_items,
                         base_size,
@@ -1517,6 +1922,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             );
                             continue;
                         }
+                        if is_running_furniture_table(subset_items, &table, &running_furniture) {
+                            log::debug!(
+                                "page {}: rejected {}x{} running header/footer table hypothesis",
+                                page,
+                                table.rows.len(),
+                                table.columns.len()
+                            );
+                            continue;
+                        }
                         for &idx in &table.item_indices {
                             if let Some(&band_idx) = index_map.get(idx) {
                                 if let Some(&page_idx) = band_index_map.get(band_idx) {
@@ -1526,10 +1940,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        page_tables
-                            .entry(page)
-                            .or_default()
-                            .push(positioned_table(&table, chart_prose_order));
+                        table_output.record(page, &table, chart_prose_order);
                     }
                 };
 
@@ -1591,10 +2002,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(&table, chart_prose_order));
+                    table_output.record(page, &table, chart_prose_order);
                 }
             }
         }
@@ -1602,7 +2010,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // 5. Thin-rect border synthesis: last resort for PDFs that draw table
         //    borders as thin filled rectangles (common in spreadsheet exports).
         //    Only runs when ALL other methods found nothing on this page.
-        if !page_tables.contains_key(&page) {
+        if !table_output.has_detected_tables_on_page(page) {
             let page_rects: Vec<&crate::types::PdfRect> =
                 rects.iter().filter(|r| r.page == page).collect();
             let mut synth_lines: Vec<crate::types::PdfLine> = Vec::new();
@@ -1653,10 +2061,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             table_items.insert(global_idx);
                         }
                     }
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push(positioned_table(table, chart_prose_order));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
         }
@@ -1665,7 +2070,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // any band, retry heuristic detection with all items as a single band.
         // This catches borderless tables whose text-column alignment was
         // misclassified as page-layout columns.
-        if was_split && !page_tables.contains_key(&page) && !merged_band.0.is_empty() {
+        if was_split && !table_output.has_tables_on_page(page) && !merged_band.0.is_empty() {
             let (ref band_items, ref band_index_map, _, _) = merged_band;
             log::debug!(
                 "page {}: merged-band retry ({} items, was_split={})",
@@ -1703,6 +2108,15 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     );
                     continue;
                 }
+                if is_running_furniture_table(&chart_free, table, &running_furniture) {
+                    log::debug!(
+                        "page {}: rejected {}x{} merged-band running header/footer table hypothesis",
+                        page,
+                        table.rows.len(),
+                        table.columns.len()
+                    );
+                    continue;
+                }
                 for &idx in &table.item_indices {
                     if let Some(&page_idx) = chart_free_map
                         .get(idx)
@@ -1713,13 +2127,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                 }
-                page_tables
-                    .entry(page)
-                    .or_default()
-                    .push(positioned_table(table, chart_prose_order));
+                table_output.record(page, table, chart_prose_order);
             }
         }
     }
+
+    #[cfg(feature = "ocr")]
+    let mut detected_tables = table_output.complete_tables;
+    #[cfg(feature = "ocr")]
+    detected_tables.sort_by_key(|(page, _)| *page);
+    let mut page_tables = table_output.markdown_by_page;
 
     // Images are also removed before line grouping, so give them the same
     // logical chart-page position as tables before reinsertion.
@@ -1970,7 +2387,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
-        preprocess::strip_repeated_lines(lines, document_page_count)
+        furniture::strip_header_footer_lines(lines, document_page_count)
     } else {
         lines
     };
@@ -1978,7 +2395,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // Convert to markdown, inserting tables and images at appropriate positions
     let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
     band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-    to_markdown_from_lines_with_tables_and_images(
+    let markdown = to_markdown_from_lines_with_tables_and_images(
         lines,
         options,
         page_tables,
@@ -1986,7 +2403,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
-    )
+    );
+    MarkdownConversionOutput {
+        markdown,
+        #[cfg(feature = "ocr")]
+        detected_tables,
+    }
 }
 
 #[cfg(test)]
@@ -1994,6 +2416,35 @@ mod tests {
     use super::*;
     use analysis::detect_header_level;
     use classify::{is_code_like, is_list_item};
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn complete_table_output_marks_only_pages_with_emitted_tables() {
+        let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables);
+        let incomplete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0],
+            vec![vec!["header a".into(), "header b".into()]],
+            vec![0, 1],
+        );
+        output.record(1, &incomplete, None);
+        assert!(output.has_detected_tables_on_page(1));
+        assert!(!output.has_tables_on_page(1));
+        assert!(output.complete_tables.is_empty());
+
+        let complete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0, 280.0],
+            vec![
+                vec!["header a".into(), "header b".into()],
+                vec!["value a".into(), "value b".into()],
+            ],
+            vec![0, 1, 2, 3],
+        );
+        output.record(1, &complete, None);
+        assert!(output.has_tables_on_page(1));
+        assert_eq!(output.complete_tables.len(), 1);
+    }
 
     #[test]
     fn test_is_list_item() {
@@ -2058,6 +2509,174 @@ mod tests {
         assert!(md.contains("- Second item"));
     }
 
+    fn furniture_item(text: &str, x: f32, y: f32, page: u32) -> TextItem {
+        let mut it = make_item(x, y, page);
+        it.text = text.into();
+        it
+    }
+
+    /// Items repeating verbatim at the same position on 3+ pages are running
+    /// furniture; the same text on fewer pages, or at different positions, is
+    /// not.
+    #[test]
+    fn running_furniture_requires_three_pages_at_same_position() {
+        let mut items = Vec::new();
+        for page in 1..=3 {
+            // Body content so each page has a real vertical extent.
+            items.push(furniture_item("body", 85.0, 700.0, page));
+            items.push(furniture_item("TITULAR DEL", 85.0, 68.0, page));
+        }
+        // Same text but only two pages.
+        for page in 1..=2 {
+            items.push(furniture_item("SECRETARÍA", 200.0, 68.0, page));
+        }
+        // Same text on three pages but at drifting positions.
+        for (page, x) in [(1, 300.0), (2, 320.0), (3, 340.0)] {
+            items.push(furniture_item("MÉXICO", x, 68.0, page));
+        }
+
+        let running = running_furniture_keys(&items);
+        assert!(running.contains(&furniture_key(&furniture_item(
+            "TITULAR DEL",
+            85.0,
+            68.0,
+            1
+        ))));
+        assert!(!running.contains(&furniture_key(&furniture_item(
+            "SECRETARÍA",
+            200.0,
+            68.0,
+            1
+        ))));
+        assert!(!running.contains(&furniture_key(&furniture_item("MÉXICO", 300.0, 68.0, 1))));
+    }
+
+    /// A table made of running-footer items is vetoed; a table whose body rows
+    /// carry per-page content is kept even when its header row repeats.
+    #[test]
+    fn running_furniture_table_veto() {
+        // The footer block, present identically on pages 1-3.
+        let mut items = Vec::new();
+        for page in 1..=3 {
+            items.push(furniture_item("PROPOSICIÓN CON PUNTO", 85.0, 78.5, page));
+            items.push(furniture_item("EL SENADO", 286.6, 78.5, page));
+            items.push(furniture_item("TITULAR DEL", 85.0, 68.0, page));
+            items.push(furniture_item("A TRAVÉS DE LA", 243.4, 68.0, page));
+        }
+        // A real table on page 1: repeated header row, per-page data rows.
+        let header = [
+            furniture_item("Year", 85.0, 500.0, 1),
+            furniture_item("Total", 200.0, 500.0, 1),
+        ];
+        let data = [
+            furniture_item("2023", 85.0, 488.0, 1),
+            furniture_item("1,204", 200.0, 488.0, 1),
+            furniture_item("2024", 85.0, 476.0, 1),
+            furniture_item("1,377", 200.0, 476.0, 1),
+        ];
+        // Header repeats on every page (like a continued table's header).
+        for page in 2..=3 {
+            items.push(furniture_item("Year", 85.0, 500.0, page));
+            items.push(furniture_item("Total", 200.0, 500.0, page));
+        }
+        items.extend(header.iter().cloned());
+        items.extend(data.iter().cloned());
+
+        let running = running_furniture_keys(&items);
+
+        let table_of = |detection_items: &[TextItem]| crate::tables::Table {
+            columns: vec![],
+            rows: vec![],
+            cells: vec![],
+            item_indices: (0..detection_items.len()).collect(),
+            kind: crate::tables::TableKind::Data,
+        };
+
+        // Footer-only candidate: every item is furniture -> vetoed.
+        let footer_items: Vec<TextItem> = (1..=1)
+            .flat_map(|page| {
+                vec![
+                    furniture_item("PROPOSICIÓN CON PUNTO", 85.0, 78.5, page),
+                    furniture_item("EL SENADO", 286.6, 78.5, page),
+                    furniture_item("TITULAR DEL", 85.0, 68.0, page),
+                    furniture_item("A TRAVÉS DE LA", 243.4, 68.0, page),
+                ]
+            })
+            .collect();
+        assert!(is_running_furniture_table(
+            &footer_items,
+            &table_of(&footer_items),
+            &running
+        ));
+
+        // Real table: header row repeats across pages, body rows do not ->
+        // 2 furniture of 6 items (33%) stays under the 80% threshold.
+        let real_items: Vec<TextItem> =
+            header.iter().cloned().chain(data.iter().cloned()).collect();
+        assert!(!is_running_furniture_table(
+            &real_items,
+            &table_of(&real_items),
+            &running
+        ));
+    }
+
+    /// A form template repeated per record carries identical labels at
+    /// identical mid-page coordinates on every page — those are real table
+    /// cells, not furniture. Only the page-edge bands qualify.
+    #[test]
+    fn mid_page_repetition_is_not_furniture() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            // Content spanning the page: y 60 (bottom) to 740 (top).
+            items.push(furniture_item("body top", 85.0, 740.0, page));
+            items.push(furniture_item("body bottom", 85.0, 60.0, page));
+            // Form labels repeated dead centre on every page.
+            items.push(furniture_item("Name of creditor", 85.0, 400.0, page));
+            items.push(furniture_item("Amount of claim", 300.0, 400.0, page));
+            // A genuine footer inside the bottom band.
+            items.push(furniture_item("FORM 78 — page footer", 85.0, 70.0, page));
+        }
+
+        let running = running_furniture_keys(&items);
+        assert!(
+            !running.contains(&furniture_key(&furniture_item(
+                "Name of creditor",
+                85.0,
+                400.0,
+                1
+            ))),
+            "mid-page form labels must not be furniture"
+        );
+        assert!(running.contains(&furniture_key(&furniture_item(
+            "FORM 78 — page footer",
+            85.0,
+            70.0,
+            1
+        ))));
+    }
+
+    #[test]
+    fn running_furniture_empty_on_short_documents() {
+        let mut items = Vec::new();
+        for page in 1..=2 {
+            items.push(furniture_item("body", 85.0, 700.0, page));
+            items.push(furniture_item("FOOTER", 85.0, 68.0, page));
+        }
+        assert!(running_furniture_keys(&items).is_empty());
+    }
+
+    /// A page whose text has no vertical span (a single line) gives no
+    /// evidence of where its edges are; its items never become furniture.
+    #[test]
+    fn zero_span_page_contributes_no_furniture() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            items.push(furniture_item("ROW LABEL", 85.0, 400.0, page));
+            items.push(furniture_item("ROW VALUE", 300.0, 400.0, page));
+        }
+        assert!(running_furniture_keys(&items).is_empty());
+    }
+
     fn make_item(x: f32, y: f32, page: u32) -> TextItem {
         TextItem {
             text: "A".into(),
@@ -2066,14 +2685,19 @@ mod tests {
             width: 5.0,
             height: 10.0,
             font: String::new(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -2320,6 +2944,218 @@ mod tests {
     }
 
     #[test]
+    fn weave_and_list_projections_are_rejected() {
+        // Tiny 2-column weave: prose continues down each column across an
+        // empty cell, so lookback (not just adjacent rows) must connect it.
+        let tiny_weave = crate::tables::Table::new(
+            vec![70.0, 300.0],
+            vec![320.0, 300.0, 280.0],
+            vec![
+                vec![
+                    "spawning aggregations, 45% were unknown, 33% were".into(),
+                    "of exploited grouper aggregations globally, as noted by".into(),
+                ],
+                vec![
+                    "".into(),
+                    "fisher interviews, monitoring, or underwater surveys done".into(),
+                ],
+                vec![
+                    "decreasing, and 5% were already gone from the region".into(),
+                    "records collected over the previous two survey decades".into(),
+                ],
+            ],
+            (0..5).collect(),
+        );
+        assert!(is_parallel_prose_table(&tiny_weave), "tiny grid weave");
+
+        // Wide projection: continuations outnumber rows and flow in 3+
+        // columns of long prose fragments.
+        let wide_weave = crate::tables::Table::new(
+            vec![60.0, 160.0, 260.0, 360.0, 460.0],
+            vec![400.0, 380.0, 360.0, 340.0, 320.0, 300.0],
+            vec![
+                vec![
+                    "check all of your emotions carefully before".into(),
+                    "causes strong visceral reactions and it".into(),
+                    "if a claim ever seems clearly designed to".into(),
+                    "chapters we are still reviewing in the".into(),
+                    "".into(),
+                ],
+                vec![
+                    "sharing anything further with your own".into(),
+                    "should always give you pause and reason".into(),
+                    "provoke rather than genuinely inform the".into(),
+                    "focusing our efforts on researching a".into(),
+                    "".into(),
+                ],
+                vec![
+                    "closest colleagues and all of their many".into(),
+                    "before finally deciding to pass along the".into(),
+                    "reader it deserves careful scrutiny and".into(),
+                    "wicked problem, and these are certainly".into(),
+                    "".into(),
+                ],
+                vec![
+                    "networks of trusted contacts and friends".into(),
+                    "message along to anyone else who asks it".into(),
+                    "verification through multiple separate and".into(),
+                    "not simple topics anyone can summarize".into(),
+                    "".into(),
+                ],
+                vec![
+                    "who might spread it much further still and".into(),
+                    "in the entire organization or well beyond".into(),
+                    "independent sources of record and archive".into(),
+                    "quickly for the busy executive readers".into(),
+                    "".into(),
+                ],
+                vec![
+                    "without ever checking any part of it first".into(),
+                    "the original recipients list and beyond it".into(),
+                    "before acting on the contents of anything".into(),
+                    "who needs only the short version of this".into(),
+                    "".into(),
+                ],
+            ],
+            (0..24).collect(),
+        );
+        assert!(
+            is_parallel_prose_table(&wide_weave),
+            "continuation-dominated"
+        );
+
+        // Reference-table protection: wrapped short citation fragments
+        // continue in every column but never read as running text
+        // (long_prose = 0) — must stay a table.
+        let reference_grid = crate::tables::Table::new(
+            vec![70.0, 220.0, 370.0],
+            vec![400.0, 380.0, 360.0, 340.0, 320.0, 300.0],
+            vec![
+                vec![
+                    "§1.338(h)(10)-1(f)".into(),
+                    "§1.331-1(d), and".into(),
+                    "§1.331-1T(d) and".into(),
+                ],
+                vec!["".into(), "§1.332-6".into(), "§1.332-6T".into()],
+                vec!["§1.382-2T(h)(4)(vi)".into(), "section".into(), "11T".into()],
+                vec!["§1.382-8(a)".into(), "and (c)(5) of this".into(), "".into()],
+                vec![
+                    "The last sentence of".into(),
+                    "paragraph (a)(2)(ii)".into(),
+                    "paragraph (a) of".into(),
+                ],
+                vec![
+                    "§1.382-2T(h)(4)(vi)(B)".into(),
+                    "section".into(),
+                    "11T".into(),
+                ],
+            ],
+            (0..16).collect(),
+        );
+        assert!(!is_parallel_prose_table(&reference_grid), "reference grid");
+
+        // Citation block over-fragmented into a wide word grid.
+        let word_grid = crate::tables::Table::new(
+            vec![60.0, 130.0, 200.0, 270.0, 340.0, 410.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec![
+                    "Songfang".into(),
+                    "Huang,".into(),
+                    "and".into(),
+                    "Fei Huang.".into(),
+                    "2023.".into(),
+                    "Rrhf:".into(),
+                ],
+                vec![
+                    "Rank".into(),
+                    "responses".into(),
+                    "to align".into(),
+                    "language".into(),
+                    "models".into(),
+                    "with".into(),
+                ],
+                vec![
+                    "human".into(),
+                    "feedback".into(),
+                    "without".into(),
+                    "tears.".into(),
+                    "arXiv".into(),
+                    "preprint".into(),
+                ],
+                vec![
+                    "arXiv:2304".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                ],
+            ],
+            (0..19).collect(),
+        );
+        assert!(is_parallel_prose_table(&word_grid), "word-fragment grid");
+
+        // Numbered list projected onto marker|text columns.
+        let marker_list = crate::tables::Table::new(
+            vec![70.0, 100.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec!["1.".into(), "Edward Bernays".into()],
+                vec!["2.".into(), "Wikipedia. Public Relations".into()],
+                vec!["3.".into(), "Pinterest. Retrieved June 10, 2021.".into()],
+                vec!["4.".into(), "Museum of Public Relations".into()],
+            ],
+            (0..8).collect(),
+        );
+        assert!(is_parallel_prose_table(&marker_list), "ordinal marker list");
+
+        // Numbered list items woven beside sidebar fragments.
+        let prefixed_list = crate::tables::Table::new(
+            vec![70.0, 340.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec![
+                    "1. Restructuring the administration of the program".into(),
+                    "".into(),
+                ],
+                vec![
+                    "2. Shifting priorities for resource allocation".into(),
+                    "freedom to decide".into(),
+                ],
+                vec![
+                    "3. Pursuing regulatory reform across agencies".into(),
+                    "".into(),
+                ],
+                vec![
+                    "4. Reinvesting savings from system reorganization".into(),
+                    "control over resources".into(),
+                ],
+            ],
+            (0..6).collect(),
+        );
+        assert!(
+            is_parallel_prose_table(&prefixed_list),
+            "ordinal-prefixed list"
+        );
+
+        // Ranked data tables use bare numbers (no list-marker punctuation)
+        // and stay tables.
+        let ranked = crate::tables::Table::new(
+            vec![70.0, 340.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec!["1".into(), "Golden Eagle Aviation".into()],
+                vec!["2".into(), "Northern Star Freight".into()],
+                vec!["3".into(), "Pacific Rim Cargo".into()],
+                vec!["4".into(), "Atlas Air Services".into()],
+            ],
+            (0..8).collect(),
+        );
+        assert!(!is_parallel_prose_table(&ranked), "ranked table");
+    }
+
+    #[test]
     fn parallel_prose_table_is_rejected_but_real_table_is_preserved() {
         assert!(merged_retry_skips_body_font(true, false));
         assert!(!merged_retry_skips_body_font(true, true));
@@ -2368,6 +3204,35 @@ mod tests {
             (0..6).collect(),
         );
         assert!(!is_parallel_prose_table(&data));
+
+        // A compact header row atop parallel prose columns: cross-row prose
+        // continuations outnumber the rows, so the header cannot save the
+        // candidate — this is page prose with two short fragments on top.
+        let headed_parallel_prose = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![340.0, 320.0, 300.0, 280.0, 260.0],
+            vec![
+                vec!["June 2023".into(), "Page 5".into()],
+                vec![
+                    "the committee reviewed the proposal and decided that the".into(),
+                    "funding for the second phase would continue subject to the".into(),
+                ],
+                vec![
+                    "implementation schedule should be extended by another".into(),
+                    "quarterly reviews established during the first phase of the".into(),
+                ],
+                vec![
+                    "six months to accommodate the revised procurement rules".into(),
+                    "".into(),
+                ],
+                vec![
+                    "adopted at the previous meeting of the governing board".into(),
+                    "participating institutions across the partner regions".into(),
+                ],
+            ],
+            (0..10).collect(),
+        );
+        assert!(is_parallel_prose_table(&headed_parallel_prose));
 
         let headed_text_table = crate::tables::Table::new(
             vec![90.0, 340.0],

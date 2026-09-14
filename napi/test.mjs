@@ -3,11 +3,13 @@ import { strict as assert } from 'assert';
 import {
   processPdf,
   processPdfAsync,
+  processPdfWithOcr,
   detectPdf,
   classifyPdf,
   classifyPdfAsync,
   extractText,
   extractTextWithPositions,
+  extractTextWithPositionsAndRotations,
   extractStructureElements,
   extractTextInRegions,
   detectVectorGridInRegion,
@@ -70,6 +72,8 @@ assert.equal(typeof item.x, 'number');
 assert.equal(typeof item.y, 'number');
 assert.equal(typeof item.width, 'number');
 assert.equal(typeof item.height, 'number');
+assert.equal(typeof item.rotation, 'number');
+assert.equal(typeof item.advanceKnown, 'boolean');
 assert.equal(typeof item.font, 'string');
 assert.equal(typeof item.fontSize, 'number');
 assert.equal(typeof item.page, 'number');
@@ -92,6 +96,46 @@ assert.ok(
   'tagged PDF text items should carry Marked Content IDs',
 );
 console.log('  extractTextWithPositions mcid: OK');
+
+// rotation: a 90° margin stamp keeps a tall, thin axis-aligned box instead of
+// collapsing to width 0, and reports its baseline angle
+const rotatedFixture = readFileSync('../tests/fixtures/rotated_margin_stamp.pdf');
+const rotatedItems = extractTextWithPositions(rotatedFixture);
+const stamp = rotatedItems.find(i => i.text.startsWith('arXiv:'));
+assert.ok(stamp, 'rotated stamp item should be extracted');
+assert.ok(Math.abs(stamp.rotation - 90) < 1e-3, `stamp rotation ${stamp.rotation}`);
+assert.ok(
+  stamp.height > 10 * stamp.width,
+  `stamp box should be tall and thin, got ${stamp.width}x${stamp.height}`,
+);
+assert.ok(
+  rotatedItems.every(i => i.text.trim() === '' || i.width > 0),
+  'no run with glyphs may be zero-width',
+);
+assert.ok(rotatedItems.filter(i => !i.text.startsWith('arXiv:')).every(i => i.rotation === 0));
+assert.ok(rotatedItems.every(i => i.advanceKnown === true), 'Helvetica carries metrics for every run');
+console.log('  extractTextWithPositions rotation: OK');
+
+// the stamp belongs to the margin box only, never to the body paragraph
+const stampRegions = extractTextInRegions(rotatedFixture, [
+  { page: 0, regions: [[0, 0, 50, 792], [60, 0, 612, 792]] },
+]);
+assert.equal(stampRegions[0].regions[0].text.trim(), 'arXiv:2301.00001v1 [cs.CL] 1 Jan 2023');
+assert.ok(!stampRegions[0].regions[1].text.includes('arXiv'), 'stamp leaked into body region');
+assert.ok(stampRegions[0].regions[1].text.includes('The quick brown fox'));
+console.log('  extractTextInRegions rotated margin run: OK');
+
+// page frames: an upright page reports none; a page whose text is rotated
+// 90° counter-clockwise is re-based and reported as 'ccw'
+const upright = extractTextWithPositionsAndRotations(fixture);
+assert.ok(upright.items.length > 0);
+assert.deepEqual(upright.pageRotations, []);
+const rotatedPageFixture = readFileSync('../tests/fixtures/tnagriculture_06_12.pdf');
+const turned = extractTextWithPositionsAndRotations(rotatedPageFixture);
+assert.ok(turned.items.length > 0);
+assert.deepEqual(turned.pageRotations, [{ page: 1, rotation: 'ccw' }]);
+assert.ok(turned.items.every(i => i.page !== 1 || i.rotation === 0 || i.rotation === 270));
+console.log('  extractTextWithPositionsAndRotations: OK');
 
 // --- extractStructureElements ---
 console.log('Testing extractStructureElements...');
@@ -135,6 +179,36 @@ assert.equal(regionResults[0].regions.length, 1);
 assert.equal(typeof regionResults[0].regions[0].text, 'string');
 assert.equal(typeof regionResults[0].regions[0].needsOcr, 'boolean');
 console.log('  extractTextInRegions: OK');
+
+// --- coordinate frame: positions and regions share the visible page box ---
+console.log('Testing visible page box coordinate frame...');
+// MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is written at
+// raw (120, 300), so a CropBox render puts it at (70, 240) from the box's
+// lower-left corner.
+const cropFixture = readFileSync('../tests/fixtures/cropbox_offset_origin.pdf');
+const cropItems = extractTextWithPositions(cropFixture);
+const glyph = cropItems.find(i => i.text.trim() === 'Visible glyph');
+assert.ok(glyph, 'fixture glyph should be extracted');
+assert.ok(Math.abs(glyph.x - 70) < 0.01, `glyph.x should be 70, got ${glyph.x}`);
+assert.ok(Math.abs(glyph.y - 240) < 0.01, `glyph.y should be 240, got ${glyph.y}`);
+// The region API reads the same frame: the glyph's own box in the visible
+// box's top-left space (300 x 400) yields exactly that line.
+const visibleHeight = 400;
+const glyphRegion = extractTextInRegions(cropFixture, [
+  {
+    page: 0,
+    regions: [[
+      glyph.x,
+      visibleHeight - glyph.y - glyph.height,
+      glyph.x + glyph.width,
+      visibleHeight - glyph.y,
+    ]],
+  },
+]);
+const glyphText = glyphRegion[0].regions[0].text;
+assert.ok(glyphText.includes('Visible glyph'), `region should hold the glyph, got ${glyphText}`);
+assert.ok(!glyphText.includes('Second line'), `region should not spill, got ${glyphText}`);
+console.log('  visible page box frame: OK');
 
 // --- detectVectorGridInRegion ---
 console.log('Testing detectVectorGridInRegion...');
@@ -219,6 +293,37 @@ scratch.fill(0);
 const fromMutated = await inFlight;
 assert.equal(fromMutated.markdown, result.markdown);
 console.log('  processPdfAsync input copied at call time: OK');
+
+// --- Selective OCR ---
+console.log('Testing processPdfWithOcr...');
+
+// Off exercises the complete result/provenance contract without loading
+// external PDFium, ONNX Runtime, or model artifacts.
+const ocrOff = await processPdfWithOcr(fixture, { mode: 'Off' });
+assert.equal(ocrOff.pageCount, 3);
+assert.equal(ocrOff.pages.length, 3);
+assert.deepEqual(ocrOff.pagesRoutedToOcr, []);
+assert.ok(ocrOff.pages.every(page => page.provenance.source === 'Native'));
+assert.ok(ocrOff.pages.every(page => page.provenance.ocrModel === undefined));
+assert.ok(ocrOff.markdown.length > 0);
+
+// Auto must preserve the lightweight path for clean text PDFs.
+const ocrAuto = await processPdfWithOcr(fixture);
+assert.deepEqual(ocrAuto.pagesRoutedToOcr, []);
+assert.equal(ocrAuto.renderTimeMs, 0);
+assert.equal(ocrAuto.ocrTimeMs, 0);
+
+const ocrSelected = await processPdfWithOcr(fixture, {
+  mode: 'Off',
+  pageNumbers: [2],
+});
+assert.deepEqual(ocrSelected.pages.map(page => page.pageNumber), [2]);
+
+await assert.rejects(
+  processPdfWithOcr(fixture, { mode: 'Off', pageNumbers: [0] }),
+  /page 0/,
+);
+console.log('  processPdfWithOcr: OK');
 
 // concurrent async calls all settle
 const [c1, c2, c3] = await Promise.all([

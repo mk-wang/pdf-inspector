@@ -834,6 +834,11 @@ fn ocr_tokens_to_items(
             is_strikeout: false,
             item_type: crate::types::ItemType::Text,
             mcid: None,
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            rotation: 0.0,
+            advance_known: true,
+            baseline_shift: 0.0,
         });
     }
     Ok(items)

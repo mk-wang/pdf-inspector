@@ -1,6 +1,6 @@
 """Type stubs for pdf_inspector."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 class PdfResult:
     """Result of processing a PDF file."""
@@ -27,6 +27,53 @@ class PageOcrReasons:
     reasons: list[str]
     """Machine-readable OCR reason identifiers."""
 
+class OcrModelIdentity:
+    """Exact OCR model identity retained in page provenance."""
+    name: str
+    revision: str
+
+class OcrTimings:
+    """Per-page OCR processing timings."""
+    render_ms: int
+    ocr_ms: int
+    assembly_ms: int
+
+class OcrPageProvenance:
+    """Source, model, confidence, and fallback metadata for one page."""
+    page_number: int
+    """1-indexed page number."""
+    source: Literal["native", "ocr", "fused"]
+    """'native', 'ocr', or 'fused'."""
+    ocr_model: Optional[OcrModelIdentity]
+    render_dpi: Optional[float]
+    ocr_confidence: Optional[float]
+    timings: OcrTimings
+    warnings: list[str]
+    hosted_recommended: bool
+
+class OcrPageResult:
+    """Final Markdown and provenance for one page."""
+    page_number: int
+    """1-indexed page number."""
+    markdown: str
+    provenance: OcrPageProvenance
+
+class OcrPdfResult:
+    """Complete native/OCR Markdown output."""
+    markdown: str
+    pages: list[OcrPageResult]
+    page_count: int
+    pages_recommended_for_ocr: list[int]
+    pages_routed_to_ocr: list[int]
+    pages_recommending_hosted: list[int]
+    ocr_reasons_by_page: list[PageOcrReasons]
+    pages_with_tables: list[int]
+    pages_with_columns: list[int]
+    is_complex: bool
+    processing_time_ms: int
+    render_time_ms: int
+    ocr_time_ms: int
+
 class PdfClassification:
     """Lightweight PDF classification result."""
     pdf_type: str
@@ -37,25 +84,83 @@ class PdfClassification:
     confidence: float
 
 class TextItem:
-    """A positioned text item extracted from a PDF."""
+    """A positioned text item extracted from a PDF.
+
+    ``x``/``y`` are PDF points relative to the page's visible page box
+    (``CropBox ∩ MediaBox``, else the MediaBox; a CropBox that does not overlap
+    the MediaBox is ignored, and a page without a MediaBox is measured against
+    US Letter), origin at the box's lower-left corner with ``y`` growing upward.
+    :func:`extract_text_in_regions` reads its regions relative to the same box
+    but from its top-left corner with ``y`` growing downward; flip with the box
+    height. Pages whose text is drawn rotated by 90° are normalized into a
+    synthetic landscape frame before the shift, and ``/Rotate`` is not applied.
+    """
     text: str
     x: float
+    """Left edge, in PDF points from the visible page box's left edge."""
     y: float
+    """Baseline for text (rect bottom edge for image, link and form-field
+    items), in PDF points from the visible page box's bottom edge."""
     width: float
     height: float
+    """Axis-aligned box in PDF points (y-up): for horizontal text `y` is the
+    baseline and `height` the em size; a rotated run is tall and thin."""
+    rotation: float
+    """Rotation of the run's baseline in degrees counter-clockwise from the
+    page's x axis, in [0, 360): 0 for ordinary horizontal text, 90 for text
+    reading bottom-to-top (a rotated margin stamp), 270 for top-to-bottom,
+    180 for upside-down."""
+    advance_known: bool
+    """Whether the run's advance came from font metrics. False when the font
+    carries no width information (or an ActualText span's advance could not be
+    recovered): the box's extent along the baseline is then an estimate of half
+    an em per painted glyph (an ActualText span counts the glyphs it covers, not
+    its replacement text), not a measurement."""
     font: str
+    font_tag: str
     font_size: float
     page: int
     is_bold: bool
     is_italic: bool
     is_underline: bool
     is_strikeout: bool
+    baseline_shift: float
+    """Signed baseline offset (points) of a super/subscript glyph run from the
+    body baseline it is attached to; 0.0 for normal text. Positive = raised
+    (superscript: footnote/affiliation markers, exponents), negative = lowered
+    (subscript). Digit-only markers beside a word are already fused into it as
+    Unicode super/subscript characters ("word²") and carry 0.0."""
     item_type: str
     mcid: Optional[int]
     """Marked Content ID from the content stream's BDC/BMC operator, None when
     the text is not part of marked content. Join with the (page, mcid) pairs
     from extract_structure_elements to attach structure-tree roles in tagged
     PDFs."""
+
+class PageRotation:
+    """The coordinate frame of a page whose text was predominantly rotated."""
+    page: int
+    """1-indexed page number, matching TextItem.page."""
+    rotation: Literal["ccw", "cw"]
+    """'ccw' when the page's runs read bottom-to-top and the frame was turned so
+    they read left-to-right, 'cw' for runs reading top-to-bottom."""
+
+class PositionedText:
+    """Positioned text plus the frame of every page whose text was turned."""
+    items: list[TextItem]
+    page_rotations: list[PageRotation]
+    """One entry per re-based page; pages absent here are upright and their
+    items are in plain page coordinates."""
+
+def extract_text_with_positions_and_rotations(path: str) -> PositionedText:
+    """Extract positioned text plus the coordinate frame of every page whose
+    text was predominantly rotated (items on such pages are in the turned
+    frame)."""
+    ...
+
+def extract_text_with_positions_and_rotations_bytes(data: bytes) -> PositionedText:
+    """Bytes variant of extract_text_with_positions_and_rotations."""
+    ...
 
 class StructureElement:
     """One structure-tree element reference from a tagged PDF."""
@@ -114,6 +219,39 @@ def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResu
     """Process a PDF from bytes in memory."""
     ...
 
+def process_pdf_with_ocr(
+    path: str,
+    *,
+    mode: Literal["off", "auto", "force"] = "auto",
+    page_numbers: Optional[list[int]] = None,
+    password: Optional[str] = None,
+    dpi: float = 150.0,
+    minimum_confidence: float = 0.0,
+    hosted_recommendation_confidence: float = 0.5,
+    model_directory: Optional[str] = None,
+    offline: bool = False,
+) -> OcrPdfResult:
+    """Process a PDF through native extraction and selective OCR.
+
+    Page numbers are 1-indexed. OCR runs without holding the Python GIL.
+    """
+    ...
+
+def process_pdf_with_ocr_bytes(
+    data: bytes,
+    *,
+    mode: Literal["off", "auto", "force"] = "auto",
+    page_numbers: Optional[list[int]] = None,
+    password: Optional[str] = None,
+    dpi: float = 150.0,
+    minimum_confidence: float = 0.0,
+    hosted_recommendation_confidence: float = 0.5,
+    model_directory: Optional[str] = None,
+    offline: bool = False,
+) -> OcrPdfResult:
+    """Process PDF bytes through native extraction and selective OCR."""
+    ...
+
 def detect_pdf(path: str) -> PdfResult:
     """Fast detection only — no text extraction."""
     ...
@@ -139,11 +277,31 @@ def extract_text_bytes(data: bytes) -> str:
     ...
 
 def extract_text_with_positions(path: str, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information."""
+    """Extract text with position information.
+
+    ``x``/``y`` are PDF points relative to the page's visible page box
+    (``CropBox ∩ MediaBox``, else the MediaBox), origin at its lower-left
+    corner with ``y`` up. :func:`extract_text_in_regions` reads regions
+    relative to the same box from its top-left corner, so flip with the box
+    height ``h``: for text items ``y`` is the baseline and
+    ``[x, h - y - height, x + width, h - y]`` covers the glyph band above it
+    (descenders fall below); for image, link and form-field items ``y`` is the
+    rect bottom and that box is exact. Pages whose text is drawn rotated by
+    90° are normalized into a synthetic landscape frame, where this does not
+    apply.
+
+    Args:
+        path: Path to the PDF file.
+        pages: Optional list of 1-indexed pages (matching ``TextItem.page``).
+            When ``None`` (default), the whole document is returned.
+    """
     ...
 
 def extract_text_with_positions_bytes(data: bytes, pages: Optional[list[int]] = None) -> list[TextItem]:
-    """Extract text with position information from bytes."""
+    """Extract text with position information from bytes.
+
+    See :func:`extract_text_with_positions` for the coordinate frame.
+    """
     ...
 
 def extract_structure_elements(path: str, pages: Optional[list[int]] = None) -> list[StructureElement]:
@@ -176,6 +334,10 @@ def extract_text_in_regions(
     Args:
         path: Path to the PDF file.
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
+            Coordinates are PDF points with top-left origin, relative to the
+            visible page box (``CropBox ∩ MediaBox``, else the MediaBox) — the
+            same box :func:`extract_text_with_positions` reports items in,
+            flipped to a top-left origin (``y_top = box_height - y``).
     """
     ...
 
@@ -188,6 +350,7 @@ def extract_text_in_regions_bytes(
     Args:
         data: PDF file contents as bytes.
         page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
+            Coordinates: see :func:`extract_text_in_regions`.
     """
     ...
 

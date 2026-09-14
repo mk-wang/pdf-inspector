@@ -16,6 +16,11 @@ def fixture_bytes(name: str) -> bytes:
         return f.read()
 
 
+# Fixtures that need a user password to open. `process_pdf` has no password
+# parameter, so these are exercised through `process_pdf_with_ocr`, which does.
+ENCRYPTED_FIXTURE_PASSWORDS = {"encrypted-secret123.pdf": "secret123"}
+
+
 # ---------------------------------------------------------------------------
 # process_pdf
 # ---------------------------------------------------------------------------
@@ -35,6 +40,10 @@ class TestProcessPdf:
         r = repr(result)
         assert "PdfResult" in r
         assert "text_based" in r
+
+    def test_encrypted_pdf_without_password_raises(self):
+        with pytest.raises(ValueError, match="encrypted"):
+            pdf_inspector.process_pdf(fixture_path("encrypted-secret123.pdf"))
 
     def test_with_pages(self):
         result = pdf_inspector.process_pdf(
@@ -76,6 +85,64 @@ class TestProcessPdfBytes:
         result = pdf_inspector.process_pdf_bytes(data, pages=[1, 2])
         assert result.markdown is not None
 
+
+# ---------------------------------------------------------------------------
+# process_pdf_with_ocr / process_pdf_with_ocr_bytes
+# ---------------------------------------------------------------------------
+
+
+class TestProcessPdfWithOcr:
+    def test_off_mode_has_full_provenance_without_external_runtimes(self):
+        result = pdf_inspector.process_pdf_with_ocr(
+            fixture_path("thermo-freon12.pdf"), mode="off"
+        )
+        assert result.page_count == 3
+        assert len(result.pages) == 3
+        assert result.pages_routed_to_ocr == []
+        assert all(page.provenance.source == "native" for page in result.pages)
+        assert all(page.provenance.ocr_model is None for page in result.pages)
+        assert result.markdown
+        assert "OcrPdfResult" in repr(result)
+
+    def test_password_opens_encrypted_fixture(self):
+        filename = "encrypted-secret123.pdf"
+        password = ENCRYPTED_FIXTURE_PASSWORDS[filename]
+        result = pdf_inspector.process_pdf_with_ocr(
+            fixture_path(filename), mode="off", password=password
+        )
+        assert result.page_count > 0
+        assert "Procurement" in result.markdown
+
+        result = pdf_inspector.process_pdf_with_ocr_bytes(
+            fixture_bytes(filename), mode="off", password=password
+        )
+        assert "Procurement" in result.markdown
+
+    def test_auto_mode_skips_external_runtimes_for_clean_text(self):
+        result = pdf_inspector.process_pdf_with_ocr_bytes(
+            fixture_bytes("thermo-freon12.pdf")
+        )
+        assert result.pages_routed_to_ocr == []
+        assert result.render_time_ms == 0
+        assert result.ocr_time_ms == 0
+
+    def test_selected_pages_are_one_indexed(self):
+        result = pdf_inspector.process_pdf_with_ocr(
+            fixture_path("thermo-freon12.pdf"), mode="off", page_numbers=[2]
+        )
+        assert [page.page_number for page in result.pages] == [2]
+
+    def test_rejects_invalid_options(self):
+        with pytest.raises(ValueError, match="mode must be"):
+            pdf_inspector.process_pdf_with_ocr(
+                fixture_path("thermo-freon12.pdf"), mode="sometimes"
+            )
+        with pytest.raises(ValueError, match="page 0"):
+            pdf_inspector.process_pdf_with_ocr(
+                fixture_path("thermo-freon12.pdf"),
+                mode="off",
+                page_numbers=[0],
+            )
 
 # ---------------------------------------------------------------------------
 # detect_pdf / detect_pdf_bytes
@@ -170,6 +237,8 @@ class TestExtractTextWithPositions:
         assert isinstance(item.y, float)
         assert isinstance(item.width, float)
         assert isinstance(item.height, float)
+        assert isinstance(item.rotation, float)
+        assert isinstance(item.advance_known, bool)
         assert isinstance(item.font, str)
         assert isinstance(item.font_size, float)
         assert isinstance(item.page, int)
@@ -275,6 +344,61 @@ class TestExtractStructureElements:
     def test_not_a_pdf(self):
         with pytest.raises(ValueError):
             pdf_inspector.extract_structure_elements_bytes(b"not a pdf")
+
+
+# ---------------------------------------------------------------------------
+# Coordinate frame: positions and regions share the visible page box
+# ---------------------------------------------------------------------------
+
+
+class TestVisiblePageBoxFrame:
+    """Positions and regions are relative to the visible page box (CropBox)."""
+
+    FIXTURE = "cropbox_offset_origin.pdf"
+
+    @staticmethod
+    def _glyph(items):
+        glyph = next(
+            (item for item in items if item.text.strip() == "Visible glyph"), None
+        )
+        assert glyph is not None, (
+            f"fixture glyph missing from {[item.text for item in items]}"
+        )
+        return glyph
+
+    def test_positions_are_relative_to_cropbox_origin(self):
+        # MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is
+        # written at raw (120, 300), so a CropBox render puts it at (70, 240)
+        # from the box's lower-left corner.
+        glyph = self._glyph(
+            pdf_inspector.extract_text_with_positions(fixture_path(self.FIXTURE))
+        )
+        assert glyph.x == pytest.approx(70.0, abs=0.01)
+        assert glyph.y == pytest.approx(240.0, abs=0.01)
+        from_bytes = self._glyph(
+            pdf_inspector.extract_text_with_positions_bytes(
+                fixture_bytes(self.FIXTURE)
+            )
+        )
+        assert (from_bytes.x, from_bytes.y) == (glyph.x, glyph.y)
+
+    def test_regions_read_the_same_frame(self):
+        glyph = self._glyph(
+            pdf_inspector.extract_text_with_positions(fixture_path(self.FIXTURE))
+        )
+        visible_height = 400.0  # the CropBox is 300 x 400
+        region = [
+            glyph.x,
+            visible_height - glyph.y - glyph.height,
+            glyph.x + glyph.width,
+            visible_height - glyph.y,
+        ]
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path(self.FIXTURE), [(0, [region])]
+        )
+        text = results[0].regions[0].text
+        assert "Visible glyph" in text
+        assert "Second line" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +589,17 @@ class TestMultipleFixtures:
         [f for f in os.listdir(FIXTURES_DIR) if f.endswith(".pdf")],
     )
     def test_process_all_fixtures(self, filename):
+        password = ENCRYPTED_FIXTURE_PASSWORDS.get(filename)
+        if password is not None:
+            # `process_pdf` cannot open encrypted files; use the password-aware
+            # entry point with OCR disabled so no external runtime is needed.
+            result = pdf_inspector.process_pdf_with_ocr(
+                fixture_path(filename), mode="off", password=password
+            )
+            assert result.page_count > 0
+            assert result.markdown
+            return
+
         result = pdf_inspector.process_pdf(fixture_path(filename))
         assert result.pdf_type in (
             "text_based",
@@ -474,3 +609,59 @@ class TestMultipleFixtures:
         )
         assert result.page_count > 0
         assert result.confidence >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# rotated text-run geometry (fixture: rotated_margin_stamp.pdf)
+# ---------------------------------------------------------------------------
+
+
+ROTATED_STAMP_TEXT = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023"
+
+
+class TestRotatedRunGeometry:
+    def test_rotated_margin_run_has_tall_thin_box(self):
+        items = pdf_inspector.extract_text_with_positions(
+            fixture_path("rotated_margin_stamp.pdf")
+        )
+        stamp = next(i for i in items if i.text == ROTATED_STAMP_TEXT)
+        # 90° counter-clockwise: reads bottom-to-top, one em wide, advance tall.
+        assert abs(stamp.rotation - 90.0) < 1e-3
+        assert stamp.height > 10 * stamp.width
+        assert all(i.width > 0 for i in items if i.text.strip())
+        assert all(i.rotation == 0.0 for i in items if i.text != ROTATED_STAMP_TEXT)
+        assert all(i.advance_known for i in items)
+
+    def test_rotated_margin_run_assigned_to_margin_region_only(self):
+        results = pdf_inspector.extract_text_in_regions(
+            fixture_path("rotated_margin_stamp.pdf"),
+            [(0, [[0.0, 0.0, 50.0, 792.0], [60.0, 0.0, 612.0, 792.0]])],
+        )
+        margin, body = results[0].regions
+        assert margin.text.strip() == ROTATED_STAMP_TEXT
+        assert not margin.needs_ocr
+        assert "arXiv" not in body.text
+        assert "The quick brown fox" in body.text
+
+
+# ---------------------------------------------------------------------------
+# extract_text_with_positions_and_rotations
+# ---------------------------------------------------------------------------
+
+
+class TestPositionedTextWithRotations:
+    def test_upright_page_reports_no_rotation(self):
+        positioned = pdf_inspector.extract_text_with_positions_and_rotations(
+            fixture_path("rotated_margin_stamp.pdf")
+        )
+        assert len(positioned.items) > 0
+        assert positioned.page_rotations == []
+
+    def test_rotated_page_reports_its_frame(self):
+        positioned = pdf_inspector.extract_text_with_positions_and_rotations_bytes(
+            fixture_bytes("tnagriculture_06_12.pdf")
+        )
+        assert len(positioned.items) > 0
+        frames = [(r.page, r.rotation) for r in positioned.page_rotations]
+        assert frames == [(1, "ccw")]
+        assert "PageRotation" in repr(positioned.page_rotations[0])

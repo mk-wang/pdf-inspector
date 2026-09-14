@@ -4,7 +4,7 @@
 //! No PDF parsing happens here — these are shared across the extraction
 //! and markdown pipelines.
 
-use crate::types::TextItem;
+use crate::types::{ItemType, TextItem};
 use unicode_normalization::UnicodeNormalization;
 
 /// Return whether text is an explicit page-number expression.
@@ -118,7 +118,7 @@ pub(crate) fn is_rtl_char(c: char) -> bool {
     )
 }
 
-fn is_arabic_presentation_form(c: char) -> bool {
+pub(crate) fn is_arabic_presentation_form(c: char) -> bool {
     // U+FEFF is BOM/ZWNJ, not an Arabic presentation form despite falling
     // in the Presentation Forms-B codepoint range.
     matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')
@@ -129,12 +129,21 @@ where
     I: Iterator<Item = S>,
     S: AsRef<str>,
 {
+    // Only letters vote: the RTL blocks embed weak-directionality characters
+    // (Arabic-Indic digits, number separators, combining marks) that are bidi
+    // class AN/NSM per UAX #9, not strong RTL — a digits-only line must stay
+    // neutral, matching how ASCII digits don't vote LTR. Combining marks need
+    // their own check: vowel points like U+064E are Other_Alphabetic, so
+    // is_alphabetic() alone would let a marks-only line vote RTL.
     let (mut rtl, mut ltr) = (0u32, 0u32);
     for t in texts {
         for c in t.as_ref().chars() {
+            if !c.is_alphabetic() || unicode_normalization::char::is_combining_mark(c) {
+                continue;
+            }
             if is_rtl_char(c) {
                 rtl += 1;
-            } else if c.is_alphabetic() && !is_cjk_char(c) {
+            } else if !is_cjk_char(c) {
                 ltr += 1;
             }
         }
@@ -142,12 +151,161 @@ where
     rtl > 0 && rtl > ltr
 }
 
+/// Combining marks by general category (Mn) or nonzero canonical combining
+/// class. Both signals are needed: Thaana vowel signs are Mn with ccc 0,
+/// while some reordering marks are not Mn.
+fn is_combining_mark(c: char) -> bool {
+    unicode_normalization::char::is_combining_mark(c)
+        || unicode_normalization::char::canonical_combining_class(c) != 0
+}
+
+/// Sort a table cell's items into RTL reading order: baseline bands (2pt
+/// tolerance) run top-to-bottom, items within a band run right-to-left with
+/// embedded LTR phrases restored to screen order. Band-aware sorting keeps
+/// sub/superscript baseline jitter from breaking a line's X order, which a
+/// plain Y-then-X comparator would (`total_cmp` ties only on identical Y).
+pub(crate) fn sort_rtl_cell_items<T>(
+    items: &mut [T],
+    x_of: impl Fn(&T) -> f32,
+    y_of: impl Fn(&T) -> f32,
+    text_of: impl Fn(&T) -> &str,
+) {
+    items.sort_by(|a, b| y_of(b).total_cmp(&y_of(a)));
+    let mut start = 0;
+    while start < items.len() {
+        let y0 = y_of(&items[start]);
+        let mut end = start + 1;
+        while end < items.len() && (y_of(&items[end]) - y0).abs() <= 2.0 {
+            end += 1;
+        }
+        items[start..end].sort_by(|a, b| x_of(b).total_cmp(&x_of(a)));
+        restore_embedded_ltr_runs(&mut items[start..end], &text_of);
+        start = end;
+    }
+}
+
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+    // An upside-down line of LTR runs (180°) reads towards -x: sort it by its
+    // mirrored position so the fragments come out in reading order. RTL lines
+    // are exempt: they already read in the classic RTL order (descending x),
+    // whichever way their glyphs stand, so mirroring them would reverse it.
+    // Non-text items on the line (links, form fields, images) are axis-aligned
+    // boxes reporting 0° and say nothing about the reading direction.
+    let mut text_runs = items
+        .iter()
+        .filter(|i| matches!(i.item_type, ItemType::Text));
+    let upside_down =
+        !rtl && text_runs.clone().next().is_some() && text_runs.all(|i| i.is_upside_down());
+    let key = |item: &TextItem| {
+        if upside_down {
+            -(item.x + item.width)
+        } else {
+            item.x
+        }
+    };
     if rtl {
-        items.sort_by(|a, b| b.x.total_cmp(&a.x));
+        items.sort_by(|a, b| key(b).total_cmp(&key(a)));
+        restore_embedded_ltr_runs(items, |i| i.text.as_str());
     } else {
-        items.sort_by(|a, b| a.x.total_cmp(&b.x));
+        items.sort_by(|a, b| key(a).total_cmp(&key(b)));
+    }
+}
+
+/// Reorder a right-to-left-sorted run of same-baseline items so embedded LTR
+/// phrases read in screen order — an item-granularity approximation of BiDi
+/// reordering. Within a maximal stretch of consecutive items carrying no RTL
+/// characters, the span from the first to the last item holding an
+/// alphanumeric is an LTR phrase: on screen it reads left-to-right, so
+/// emitting it right-to-left would reverse its words. Neutral items at the
+/// stretch's edges join the phrase only when they carry a bracket (BiDi
+/// pairs brackets with the text they enclose); other neutrals — sentence
+/// periods, commas — take the paragraph's RTL direction and stay put.
+pub(crate) fn restore_embedded_ltr_runs<T>(items: &mut [T], text_of: impl Fn(&T) -> &str) {
+    // An Arabic-Indic number split across items reads left-to-right even
+    // though its digits live in the RTL blocks: rejoin maximal runs of
+    // ADJACENT digit items in screen order, bridging decimal/thousands
+    // delimiters — Arabic or ASCII — that sit inside or between the pieces.
+    // These runs deliberately stay out of the Latin-phrase grouping below:
+    // the brackets and operators around an Arabic number belong to the
+    // surrounding RTL flow, unlike a Latin phrase's own brackets.
+    let is_numeric_sep = |c: char| is_arabic_numeric_separator(c) || matches!(c, '.' | ',');
+    let is_arabic_number_item = |t: &T| {
+        let mut has_digit = false;
+        for c in text_of(t).chars() {
+            if is_arabic_indic_digit(c) {
+                has_digit = true;
+            } else if !is_numeric_sep(c) && !c.is_whitespace() {
+                return false;
+            }
+        }
+        has_digit
+    };
+    // A delimiter emitted as its own item joins the number only when digit
+    // pieces flank it — a lone sentence period stays in the RTL flow.
+    let is_number_delim_item = |t: &T| {
+        let mut has_sep = false;
+        for c in text_of(t).chars() {
+            if is_numeric_sep(c) {
+                has_sep = true;
+            } else if !c.is_whitespace() {
+                return false;
+            }
+        }
+        has_sep
+    };
+    let mut i = 0;
+    while i < items.len() {
+        if !is_arabic_number_item(&items[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < items.len() {
+            if is_arabic_number_item(&items[j]) {
+                j += 1;
+            } else if is_number_delim_item(&items[j])
+                && j + 1 < items.len()
+                && is_arabic_number_item(&items[j + 1])
+            {
+                j += 2;
+            } else {
+                break;
+            }
+        }
+        if j - i >= 2 {
+            items[i..j].reverse();
+        }
+        i = j;
+    }
+
+    let has_rtl = |t: &T| text_of(t).chars().any(is_rtl_char);
+    let has_bracket = |t: &T| text_of(t).chars().any(|c| "()[]{}<>".contains(c));
+    let mut i = 0;
+    while i < items.len() {
+        if has_rtl(&items[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < items.len() && !has_rtl(&items[j]) {
+            j += 1;
+        }
+        let alnum = |t: &T| text_of(t).chars().any(char::is_alphanumeric);
+        let first = items[i..j].iter().position(&alnum).map(|p| i + p);
+        let last = items[i..j].iter().rposition(&alnum).map(|p| i + p);
+        if let (Some(mut first), Some(mut last)) = (first, last) {
+            while first > i && has_bracket(&items[first - 1]) {
+                first -= 1;
+            }
+            while last + 1 < j && has_bracket(&items[last + 1]) {
+                last += 1;
+            }
+            if last > first {
+                items[first..=last].reverse();
+            }
+        }
+        i = j;
     }
 }
 
@@ -259,35 +417,59 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
     result
 }
 
+/// Digits that fall inside the Arabic codepoint block but are stored and
+/// displayed left-to-right like ASCII digits (bidi class AN): Arabic-Indic
+/// (٠-٩) and Extended Arabic-Indic (۰-۹). Reversal must keep their runs
+/// intact — reversing them corrupts every number in the document.
+fn is_arabic_indic_digit(c: char) -> bool {
+    matches!(c, '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}')
+}
+
+/// Arabic decimal (U+066B) and thousands (U+066C) separators — punctuation
+/// that lives inside numbers and must stay with the forward-ordered digit
+/// run around it.
+fn is_arabic_numeric_separator(c: char) -> bool {
+    matches!(c, '\u{066B}' | '\u{066C}')
+}
+
+fn is_forward_alnum(c: char) -> bool {
+    c.is_ascii_alphanumeric() || is_arabic_indic_digit(c)
+}
+
 /// Reverse visual-order Arabic text to logical order.
 ///
-/// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
-/// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
-/// runs: run order is reversed, and only non-LTR runs are reversed internally.
+/// Pure RTL text (no forward-ordered alphanumerics) gets a simple character
+/// reversal. Mixed content (embedded numbers or Latin words) splits into LTR
+/// and non-LTR runs: run order is reversed, and only non-LTR runs are
+/// reversed internally.
 fn reverse_visual_arabic(text: &str) -> String {
-    // Check if there are any LTR runs (ASCII letters or digits)
-    let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
+    // Check if there are any LTR runs (Latin letters or digits of either
+    // numbering system)
+    let has_ltr = text.chars().any(is_forward_alnum);
 
     if !has_ltr {
         // Pure RTL: simple reversal
-        return text.chars().rev().collect();
+        return reverse_keeping_marks(text);
     }
 
-    // Mixed content: split into runs of LTR (ASCII alphanumeric + adjacent
-    // punctuation like '.', ',', '/', '-') vs non-LTR (Arabic + spaces + other).
+    // Mixed content: split into runs of LTR (forward-ordered alphanumerics +
+    // adjacent punctuation like '.', ',', '/', '-') vs non-LTR (Arabic +
+    // spaces + other).
     let chars: Vec<char> = text.chars().collect();
     let mut runs: Vec<(bool, String)> = Vec::new(); // (is_ltr, content)
 
+    let is_ltr_punct = |chars: &[char], i: usize| {
+        (chars[i].is_ascii_punctuation() || is_arabic_numeric_separator(chars[i]))
+            && is_adjacent_to_alnum(chars, i)
+    };
     let mut i = 0;
     while i < chars.len() {
-        let is_ltr = chars[i].is_ascii_alphanumeric()
-            || (chars[i].is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+        let is_ltr = is_forward_alnum(chars[i]) || is_ltr_punct(&chars, i);
 
         let mut run = String::new();
         while i < chars.len() {
             let c = chars[i];
-            let c_is_ltr = c.is_ascii_alphanumeric()
-                || (c.is_ascii_punctuation() && is_adjacent_to_ascii_alnum(&chars, i));
+            let c_is_ltr = is_forward_alnum(c) || is_ltr_punct(&chars, i);
             if c_is_ltr != is_ltr {
                 break;
             }
@@ -304,16 +486,119 @@ fn reverse_visual_arabic(text: &str) -> String {
         if *is_ltr {
             result.push_str(content);
         } else {
-            result.extend(content.chars().rev());
+            result.push_str(&reverse_keeping_marks(content));
         }
     }
     result
 }
 
-/// Check if the character at `idx` is adjacent to an ASCII alphanumeric character.
-fn is_adjacent_to_ascii_alnum(chars: &[char], idx: usize) -> bool {
-    (idx > 0 && chars[idx - 1].is_ascii_alphanumeric())
-        || (idx + 1 < chars.len() && chars[idx + 1].is_ascii_alphanumeric())
+/// Reverse a string's characters keeping combining marks attached to their
+/// base — a naive `chars().rev()` would detach vowel points (Hebrew nikud,
+/// Arabic harakat) from the letters they modify. Paired brackets are
+/// mirrored: visual-order storage records the on-screen glyph, which is the
+/// mirror of the logical character on the other side of the reversal.
+fn reverse_keeping_marks(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut end = chars.len();
+    let mut i = chars.len();
+    while i > 0 {
+        i -= 1;
+        if i == 0 || !is_combining_mark(chars[i]) {
+            out.extend(chars[i..end].iter().map(|&c| mirror_bracket(c)));
+            end = i;
+        }
+    }
+    out
+}
+
+fn mirror_bracket(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        '<' => '>',
+        '>' => '<',
+        _ => c,
+    }
+}
+
+/// Check if the character at `idx` is adjacent to a forward-ordered
+/// alphanumeric character (ASCII or Arabic-Indic digit).
+fn is_adjacent_to_alnum(chars: &[char], idx: usize) -> bool {
+    (idx > 0 && is_forward_alnum(chars[idx - 1]))
+        || (idx + 1 < chars.len() && is_forward_alnum(chars[idx + 1]))
+}
+
+/// A decoded show-op string qualifies for geometric visual-order RTL fixing
+/// when RTL characters dominate and at least two are present — a single RTL
+/// character reads the same in either storage order. Arabic presentation
+/// forms are excluded: their presence already triggers reversal inside
+/// `expand_ligatures`, so flagging them here would reverse twice.
+/// Arabic-Indic digits don't count toward the threshold: they're stored
+/// left-to-right in both conventions, so a bare number carries no evidence
+/// and must never be reversed.
+pub(crate) fn is_visual_rtl_candidate(text: &str) -> bool {
+    if text.chars().any(is_arabic_presentation_form) {
+        return false;
+    }
+    text.chars()
+        .filter(|&c| is_rtl_char(c) && !is_arabic_indic_digit(c) && !is_arabic_numeric_separator(c))
+        .count()
+        >= 2
+        && is_rtl_text(std::iter::once(text))
+}
+
+/// Reverse multi-character RTL runs stored in visual (screen left-to-right)
+/// order back to logical reading order.
+///
+/// PDF paints glyphs sequentially left-to-right, so producers of visible RTL
+/// text emit each run's characters in screen order — reversed relative to
+/// reading order — and walk the line's runs left-to-right. Producers that
+/// keep logical order instead position each run explicitly, walking
+/// right-to-left across the line (common in OCR text layers), and must not
+/// be reversed. The two conventions are distinguished geometrically:
+/// candidate runs emitted left-to-right along a shared baseline vote for
+/// visual storage, right-to-left emission votes for logical storage.
+/// `logical_ops` carries extra logical votes observed during parsing — show
+/// ops whose internal glyph progression already walks right-to-left.
+///
+/// Votes are pooled per page deliberately: a page is written by one
+/// producer, so its storage convention is uniform, while individual lines
+/// are often single-run and carry no votes at all. Scoping the decision per
+/// line would push most lines onto the no-vote default, and that default
+/// (reverse) is exactly what corrupts logical-order OCR layers.
+pub(crate) fn fix_visual_order_rtl(items: &mut [TextItem], candidates: &[usize], logical_ops: u32) {
+    if candidates.is_empty() {
+        return;
+    }
+    let mut rightward = 0u32;
+    let mut leftward = logical_ops;
+    for pair in candidates.windows(2) {
+        let (a, b) = (&items[pair[0]], &items[pair[1]]);
+        // Same-baseline pairs only: emission order across lines says nothing
+        // about horizontal storage direction.
+        if (a.y - b.y).abs() > a.height.max(b.height).max(1.0) * 0.5 {
+            continue;
+        }
+        if b.x > a.x + 0.1 {
+            rightward += 1;
+        } else if b.x < a.x - 0.1 {
+            leftward += 1;
+        }
+    }
+    // Ties — including the vote-less single-run case — reverse: RTL text
+    // painted with forward advances renders correctly only when stored in
+    // visual order, so visual storage is the dominant convention.
+    if leftward > rightward {
+        return;
+    }
+    for &idx in candidates {
+        items[idx].text = reverse_visual_arabic(&items[idx].text);
+    }
 }
 
 /// Decode a PDF text string (ActualText, etc.) that may be UTF-16BE (BOM \xFE\xFF)
@@ -322,8 +607,10 @@ pub(crate) fn decode_text_string(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
         // UTF-16BE with BOM
         let utf16: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect();
         String::from_utf16_lossy(&utf16)
     } else {
@@ -342,16 +629,33 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     let scale_y = (text_matrix[2].powi(2) + text_matrix[3].powi(2)).sqrt();
     // Use the larger of the two scales (usually they're equal for non-rotated text)
     let scale = scale_x.max(scale_y);
-    base_size * scale
+    // A negative `Tf` size turns the glyphs around; their size is still
+    // their size (the geometry reads the direction from the advance).
+    base_size.abs() * scale
 }
 
-/// Estimate the width of a text item, falling back to a character-count heuristic when width is 0.
+/// The item's horizontal extent for layout heuristics. The box already
+/// holds an estimate for runs whose font carries no width metrics (laid
+/// along the run at extraction, flagged by `TextItem::advance_known ==
+/// false`), so a positive width is taken as is. A box without one gets the
+/// classic half-em-per-character stand-in, as it always did — whether the
+/// width is negative (a merged item whose fragments ran backwards) or a
+/// measured zero: a glyph drawn with a zero advance (an Arabic hamza or a
+/// combining mark positioned by hand) still covers a glyph's worth of page,
+/// and column detection and region routing need that footprint or they
+/// displace it into another line and split the word. The stand-in is a
+/// layout extent only; the item's box keeps its measured width.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
     if item.width > 0.0 {
         item.width
     } else {
         item.text.chars().count() as f32 * item.font_size * 0.5
     }
+}
+
+/// The item's vertical extent — the counterpart of `effective_width`.
+pub(crate) fn effective_height(item: &TextItem) -> f32 {
+    item.height
 }
 
 pub(crate) fn is_cid_font(font: &str) -> bool {
@@ -649,7 +953,16 @@ pub(crate) fn should_join_items(
     }
 
     // When we have accurate width from font metrics, use a tight threshold
-    if prev_item.width > 0.0 {
+    // Only measured widths earn the tight threshold: a width-less font's
+    // box is a half-em-per-glyph estimate (`advance_known == false`), which
+    // stays on the loose heuristic it always used. So does a rotated pair:
+    // a vertical run's `width` is its em, not its advance, and the x gap
+    // below says nothing about how far apart the runs read.
+    if prev_item.width > 0.0
+        && prev_item.advance_known
+        && prev_item.is_upright()
+        && curr_item.is_upright()
+    {
         let gap = if prev_item.x <= curr_item.x {
             // LTR: prev is left of curr
             curr_item.x - (prev_item.x + prev_item.width)
@@ -961,6 +1274,291 @@ mod tests {
         assert!(!is_arabic_presentation_form('A'));
     }
 
+    #[test]
+    fn reverse_keeping_marks_attaches_combining_marks() {
+        // Visual "בָא" (bet+qamats, alef) reversed must keep the qamats on bet:
+        // "אבָ" — not migrate it onto alef.
+        let input = "\u{05D1}\u{05B8}\u{05D0}";
+        assert_eq!(reverse_keeping_marks(input), "\u{05D0}\u{05D1}\u{05B8}");
+    }
+
+    #[test]
+    fn reverse_keeping_marks_mirrors_brackets() {
+        // Visual-order storage records the on-screen (mirrored) bracket glyph;
+        // reversal must mirror it back.
+        let input = "(\u{05D0}\u{05D1})";
+        assert_eq!(reverse_keeping_marks(input), "(\u{05D1}\u{05D0})");
+    }
+
+    #[test]
+    fn visual_rtl_candidate_classification() {
+        // Multi-char base Hebrew: candidate
+        assert!(is_visual_rtl_candidate("\u{05E9}\u{05DC}\u{05D5}\u{05DD}"));
+        // Multi-char base Arabic: candidate
+        assert!(is_visual_rtl_candidate("\u{0645}\u{0631}\u{062D}"));
+        // Single RTL char: reads the same either way — not a candidate
+        assert!(!is_visual_rtl_candidate("\u{05E9}"));
+        // Arabic presentation forms: expand_ligatures already reverses these
+        assert!(!is_visual_rtl_candidate("\u{FEDF}\u{FEE0}"));
+        // Latin-dominant with embedded RTL: internal order is Latin's
+        assert!(!is_visual_rtl_candidate("the word \u{05E9}\u{05DC} here"));
+        // Pure Latin
+        assert!(!is_visual_rtl_candidate("Hello"));
+        // Arabic-Indic digits are stored left-to-right in both conventions:
+        // a bare "٢٤" run must never be reversed into "٤٢"
+        assert!(!is_visual_rtl_candidate("\u{0662}\u{0664}"));
+        assert!(!is_visual_rtl_candidate("\u{0663}\u{0665},\u{0660}"));
+    }
+
+    #[test]
+    fn rtl_text_direction_ignores_marks_on_both_sides() {
+        // Marks must not count as RTL: one heavily pointed Hebrew letter
+        // must not out-vote a longer Latin word in a mixed cell
+        assert!(!is_rtl_text(
+            ["AB", "\u{05D1}\u{05B8}\u{05B8}\u{05B8}\u{05B8}"].iter()
+        ));
+        // ...and marks must not count as LTR either (they carry
+        // Other_Alphabetic): a vocalized RTL cell (3 letters, 3 points)
+        // still out-votes a short Latin item
+        assert!(is_rtl_text(
+            ["\u{05E9}\u{05B8}\u{05DC}\u{05B8}\u{05DD}\u{05B8}", "ab"].iter()
+        ));
+        // Thaana vowel signs are Mn with combining class 0 — still marks:
+        // they must not count as RTL letters
+        assert!(!is_rtl_text(
+            ["ABC", "\u{078C}\u{07A6}\u{07A6}\u{07A6}"].iter()
+        ));
+    }
+
+    #[test]
+    fn arabic_numeric_separators_stay_with_digits() {
+        // U+066B decimal / U+066C thousands separators live inside numbers:
+        // the whole number is one forward run and must not split or reverse.
+        let decimal = "\u{0663}\u{0665}\u{066B}\u{0660}"; // ٣٥٫٠
+        assert_eq!(reverse_visual_arabic(decimal), decimal);
+        assert!(!is_visual_rtl_candidate(decimal));
+        let thousands = "\u{0661}\u{066C}\u{0660}\u{0660}\u{0660}"; // ١٬٠٠٠
+        assert_eq!(reverse_visual_arabic(thousands), thousands);
+    }
+
+    #[test]
+    fn reverse_visual_arabic_keeps_arabic_indic_digit_runs() {
+        // Visual storage of "٢٤ ساعة" (24 hours): letters are reversed on
+        // screen but the digit run stays left-to-right, like ASCII digits.
+        let input = "\u{0629}\u{0639}\u{0627}\u{0633} \u{0662}\u{0664}"; // ةعاس ٢٤
+        let result = reverse_visual_arabic(input);
+        assert_eq!(
+            result,
+            "\u{0662}\u{0664} \u{0633}\u{0627}\u{0639}\u{0629}" // ٢٤ ساعة
+        );
+        // Decimal fragment with punctuation glued to digits stays intact
+        let decimal = "\u{0663}\u{0665},\u{0660}"; // ٣٥,٠
+        assert_eq!(reverse_visual_arabic(decimal), decimal);
+    }
+
+    fn make_rtl_item(text: &str, x: f32, y: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: 30.0,
+            height: 12.0,
+            font: "TestFont".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn fix_visual_order_rtl_reverses_rightward_emission() {
+        // Ops painted left-to-right on one baseline = visual storage
+        let mut items = vec![
+            make_rtl_item("\u{05DD}\u{05DC}\u{05D5}\u{05E2}", 100.0, 700.0), // visual עולם
+            make_rtl_item("\u{05DD}\u{05D5}\u{05DC}\u{05E9}", 160.0, 700.0), // visual שלום
+        ];
+        fix_visual_order_rtl(&mut items, &[0, 1], 0);
+        assert_eq!(items[0].text, "\u{05E2}\u{05D5}\u{05DC}\u{05DD}"); // עולם
+        assert_eq!(items[1].text, "\u{05E9}\u{05DC}\u{05D5}\u{05DD}"); // שלום
+    }
+
+    #[test]
+    fn fix_visual_order_rtl_keeps_leftward_emission() {
+        // Ops positioned right-to-left = logical storage (OCR layers)
+        let logical_a = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}"; // שלום
+        let logical_b = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}"; // עולם
+        let mut items = vec![
+            make_rtl_item(logical_a, 160.0, 700.0),
+            make_rtl_item(logical_b, 100.0, 700.0),
+        ];
+        fix_visual_order_rtl(&mut items, &[0, 1], 0);
+        assert_eq!(items[0].text, logical_a);
+        assert_eq!(items[1].text, logical_b);
+    }
+
+    #[test]
+    fn fix_visual_order_rtl_defaults_to_reversal_without_votes() {
+        // A single run gives no geometric votes; visible RTL painted with
+        // forward advances can only be visual-order storage.
+        let mut items = vec![make_rtl_item(
+            "\u{05DD}\u{05D5}\u{05DC}\u{05E9}",
+            100.0,
+            700.0,
+        )];
+        fix_visual_order_rtl(&mut items, &[0], 0);
+        assert_eq!(items[0].text, "\u{05E9}\u{05DC}\u{05D5}\u{05DD}");
+    }
+
+    #[test]
+    fn fix_visual_order_rtl_logical_ops_outvote() {
+        // Extra logical evidence from op-internal geometry blocks reversal
+        let logical = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}";
+        let mut items = vec![
+            make_rtl_item(logical, 100.0, 700.0),
+            make_rtl_item(logical, 160.0, 700.0),
+        ];
+        fix_visual_order_rtl(&mut items, &[0, 1], 2);
+        assert_eq!(items[0].text, logical);
+        assert_eq!(items[1].text, logical);
+    }
+
+    #[test]
+    fn fix_visual_order_rtl_ignores_cross_line_pairs() {
+        // Different baselines carry no horizontal-direction information;
+        // with no votes the default (reverse) applies.
+        let mut items = vec![
+            make_rtl_item("\u{05D1}\u{05D0}", 160.0, 700.0),
+            make_rtl_item("\u{05D3}\u{05D2}", 100.0, 650.0),
+        ];
+        fix_visual_order_rtl(&mut items, &[0, 1], 0);
+        assert_eq!(items[0].text, "\u{05D0}\u{05D1}");
+        assert_eq!(items[1].text, "\u{05D2}\u{05D3}");
+    }
+
+    #[test]
+    fn restore_embedded_ltr_runs_screen_order() {
+        // RTL-sorted line: hebrew, ")", "KM1", "(", hebrew — the bracketed
+        // acronym must come back in screen order: "(", "KM1", ")".
+        let mut items = vec![
+            "\u{05E9}\u{05DC}".to_string(),
+            ")".to_string(),
+            "KM1".to_string(),
+            "(".to_string(),
+            "\u{05D5}\u{05DD}".to_string(),
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items[1], "(");
+        assert_eq!(items[2], "KM1");
+        assert_eq!(items[3], ")");
+    }
+
+    #[test]
+    fn restore_embedded_ltr_runs_rejoins_split_arabic_indic_numbers() {
+        // An Arabic-Indic number split across items sits in the RTL block
+        // but reads left-to-right: after the descending-X sort it must
+        // rejoin in screen order like Latin digits would.
+        let mut items = vec![
+            "\u{0645}\u{0631}".to_string(), // مر
+            "\u{0664}".to_string(),         // ٤
+            "\u{0662}".to_string(),         // ٢
+            "\u{062D}\u{0628}".to_string(), // حب
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items[1], "\u{0662}");
+        assert_eq!(items[2], "\u{0664}");
+    }
+
+    #[test]
+    fn restore_embedded_ltr_runs_bridges_number_delimiters() {
+        // "٢٤.٥" split around an ASCII decimal point: descending-X order is
+        // [٥][.][٢٤]; the delimiter is flanked by digit pieces, so the whole
+        // number rejoins in screen order.
+        let mut items = vec![
+            "\u{0665}".to_string(),
+            ".".to_string(),
+            "\u{0662}\u{0664}".to_string(),
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items, ["\u{0662}\u{0664}", ".", "\u{0665}"]);
+
+        // A lone period NOT flanked by a digit piece stays in the RTL flow
+        let mut items = vec![
+            "\u{0662}\u{0664}".to_string(),
+            ".".to_string(),
+            "\u{0645}\u{0631}".to_string(),
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items[0], "\u{0662}\u{0664}");
+        assert_eq!(items[1], ".");
+    }
+
+    #[test]
+    fn restore_embedded_ltr_runs_leaves_edge_neutrals() {
+        // A sentence-final period after a year stays in the RTL flow:
+        // [hebrew]["2020"]["."] must not become [hebrew]["."]["2020"].
+        let mut items = vec![
+            "\u{05DC}\u{05E9}\u{05E0}\u{05EA}".to_string(),
+            "2020".to_string(),
+            ".".to_string(),
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items[1], "2020");
+        assert_eq!(items[2], ".");
+    }
+
+    #[test]
+    fn sort_rtl_cell_items_respects_lines_and_jitter() {
+        // Two wrapped lines of an RTL cell; the second line's items carry
+        // sub/superscript baseline jitter (within the 2pt band). Lines must
+        // stay separate top-to-bottom, each line must read right-to-left
+        // despite the jitter, and LTR fragments from different visual lines
+        // must never be reordered together.
+        let mut items = vec![
+            (100.0f32, 688.0f32, "\u{05D5}\u{05DD}".to_string()),
+            (160.0f32, 688.9f32, "CD".to_string()),
+            (100.0f32, 700.0f32, "AB".to_string()),
+            (160.0f32, 700.0f32, "\u{05E9}\u{05DC}".to_string()),
+        ];
+        sort_rtl_cell_items(
+            &mut items,
+            |(x, _, _)| *x,
+            |(_, y, _)| *y,
+            |(_, _, t)| t.as_str(),
+        );
+        let texts: Vec<&str> = items.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["\u{05E9}\u{05DC}", "AB", "CD", "\u{05D5}\u{05DD}"],
+            "line 1 right-to-left, then line 2 right-to-left"
+        );
+    }
+
+    #[test]
+    fn restore_embedded_ltr_runs_multiword_phrase() {
+        // Descending-x sort put the LTR phrase words backwards; restore
+        // screen order.
+        let mut items = vec![
+            "\u{05E9}\u{05DC}".to_string(),
+            "Board".to_string(),
+            "Stability".to_string(),
+            "Financial".to_string(),
+        ];
+        restore_embedded_ltr_runs(&mut items, |s| s.as_str());
+        assert_eq!(items[1], "Financial");
+        assert_eq!(items[2], "Stability");
+        assert_eq!(items[3], "Board");
+    }
+
     /// Helper to create a single-char TextItem at a given x position with width.
     fn make_char_item(ch: char, x: f32, width: f32, font_size: f32) -> TextItem {
         TextItem {
@@ -970,14 +1568,19 @@ mod tests {
             width,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1091,14 +1694,19 @@ mod tests {
                 width: w,
                 height: fs,
                 font: "TestFont".to_string(),
+                font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: fs,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             });
             // Alternate between letter-gap and word-gap to create bimodal distribution
             x += w + if wi % 3 == 2 { word_gap } else { letter_gap };
@@ -1169,14 +1777,19 @@ mod tests {
             width,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1252,6 +1865,130 @@ mod tests {
             !should_join_items(&ized, &fo, threshold),
             "ized→fo: ratio={:.3}, should split (word boundary)",
             (fo.x - (ized.x + ized.width)) / fs
+        );
+    }
+
+    fn geometry_item(width: f32, font_size: f32, rotation: f32) -> TextItem {
+        TextItem {
+            baseline_shift: 0.0,
+            text: "abcd".to_string(),
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: font_size,
+            rotation,
+            advance_known: true,
+            font: String::new(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn join_threshold_ignores_a_vertical_runs_em_width() {
+        // For a vertical run `width` is its em, so the tight measured-width
+        // path would read the x gap to the next run as a word boundary. The
+        // pair falls back to the loose heuristic instead — which the same
+        // geometry laid out upright does not.
+        let mut prev = geometry_item(10.0, 30.0, 90.0);
+        prev.text = "ab".to_string();
+        prev.x = 100.0;
+        prev.font_size = 10.0;
+        let mut curr = geometry_item(10.0, 30.0, 90.0);
+        curr.text = "cd".to_string();
+        curr.x = 112.5;
+        curr.font_size = 10.0;
+        assert!(should_join_items(&prev, &curr, 0.1));
+
+        prev.rotation = 0.0;
+        prev.height = 10.0;
+        curr.rotation = 0.0;
+        curr.height = 10.0;
+        assert!(!should_join_items(&prev, &curr, 0.1));
+    }
+
+    #[test]
+    fn upside_down_lines_sort_right_to_left() {
+        // A 180° run reads towards -x: the fragment painted first sits at
+        // the largest x and must come first.
+        let mut hello = geometry_item(30.0, 10.0, 180.0);
+        hello.text = "HELLO".to_string();
+        hello.x = 300.0;
+        let mut world = geometry_item(30.0, 10.0, 180.0);
+        world.text = "WORLD".to_string();
+        world.x = 260.0;
+        let mut items = vec![world.clone(), hello.clone()];
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["HELLO", "WORLD"]);
+
+        // Mixed or upright lines keep ascending x.
+        items[0].rotation = 0.0;
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["WORLD", "HELLO"]);
+
+        // A link box on the line is axis-aligned (0°) and must not defeat the
+        // mirrored sort of the text around it.
+        let mut link = geometry_item(5.0, 10.0, 0.0);
+        link.text = "link".to_string();
+        link.x = 291.0;
+        link.item_type = ItemType::Link("https://example.com/".to_string());
+        let mut items = vec![world, link, hello];
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["HELLO", "link", "WORLD"]);
+
+        // An RTL line whose runs report 180° keeps the classic RTL order,
+        // first word at the largest x: mirroring it would reverse the text.
+        let mut first = geometry_item(30.0, 10.0, 180.0);
+        first.text = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}".to_string();
+        first.x = 140.0;
+        let mut second = geometry_item(30.0, 10.0, 180.0);
+        second.text = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}".to_string();
+        second.x = 100.0;
+        let mut items = vec![second.clone(), first.clone()];
+        sort_line_items(&mut items);
+        assert_eq!(items[0].text, first.text);
+        assert_eq!(items[1].text, second.text);
+    }
+
+    #[test]
+    fn extent_helpers_pass_the_box_through() {
+        // Estimates for width-less fonts are laid into the box at extraction
+        // and flagged, so the helpers never second-guess a positive width;
+        // a box without one — measured zero or backwards — falls back to
+        // half an em per character so layout has a footprint to reason with.
+        let mut zero = geometry_item(0.0, 10.0, 0.0);
+        zero.text = "ab".to_string();
+        zero.font_size = 10.0;
+        assert!(zero.advance_known);
+        assert_eq!(
+            (effective_width(&zero), effective_height(&zero)),
+            (10.0, 10.0)
+        );
+        let mut backwards = zero.clone();
+        backwards.width = -1.7;
+        assert_eq!(effective_width(&backwards), 10.0);
+        let mut unmeasured = zero.clone();
+        unmeasured.advance_known = false;
+        assert_eq!(effective_width(&unmeasured), 10.0);
+        let mut estimated = geometry_item(20.0, 10.0, 0.0);
+        estimated.advance_known = false;
+        assert_eq!(effective_width(&estimated), 20.0);
+        let mut short = geometry_item(6.0, 10.0, 45.0);
+        short.height = 5.0;
+        assert_eq!(
+            (effective_width(&short), effective_height(&short)),
+            (6.0, 5.0)
         );
     }
 }

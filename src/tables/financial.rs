@@ -104,14 +104,19 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
             width: sub_width,
             height: item.height,
             font: item.font.clone(),
+            font_tag: item.font_tag.clone(),
+            legacy_symbol_rewrite: item.legacy_symbol_rewrite,
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            rotation: item.rotation,
+            advance_known: item.advance_known,
             item_type: item.item_type.clone(),
             mcid: item.mcid,
+            baseline_shift: item.baseline_shift,
         });
     }
     Some(sub_items)
