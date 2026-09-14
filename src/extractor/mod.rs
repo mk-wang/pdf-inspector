@@ -1260,18 +1260,35 @@ fn merge_text_items_with_clips(
         .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
         .collect();
 
-    // Group items by (page, Y position) with 5pt tolerance
+    // Group items by (page, Y position) with 5pt tolerance, measured against the
+    // group's whole y span rather than only its founding item: on a page whose
+    // columns sit on offset baselines, an item of one column otherwise founds a
+    // band that reaches a line of the other column above it and a line below it,
+    // two baselines a full line apart. The x sort below then interleaves those
+    // baselines into one line, and the merge walk glues the runs that meet.
+    // A super/subscript run straddles that span on purpose — it has to stay on
+    // its anchor's line — and is recognized by its geometry (see
+    // `scripts::script_attachable_to`).
     let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
+    // (page, founding y, y span low, y span high, items)
+    let mut line_groups: Vec<(u32, f32, f32, f32, Vec<&TextItem>)> = Vec::new();
 
     for item in &items {
         let found = line_groups
             .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
+            .find(|(pg, founding_y, y_low, y_high, group)| {
+                *pg == item.page
+                    && ((item.y - *y_low).abs() < y_tolerance
+                        && (item.y - *y_high).abs() < y_tolerance
+                        || (item.y - *founding_y).abs() < y_tolerance
+                            && scripts::script_attachable_to(item, group.iter().copied()))
+            });
+        if let Some((_, _, y_low, y_high, group)) = found {
+            *y_low = y_low.min(item.y);
+            *y_high = y_high.max(item.y);
             group.push(item);
         } else {
-            line_groups.push((item.page, item.y, vec![item]));
+            line_groups.push((item.page, item.y, item.y, item.y, vec![item]));
         }
     }
 
@@ -1279,7 +1296,7 @@ fn merge_text_items_with_clips(
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
-    for (page, y, mut group) in line_groups {
+    for (page, y, _, _, mut group) in line_groups {
         let rtl = is_rtl_text(group.iter().map(|i| &i.text));
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
@@ -3622,6 +3639,53 @@ mod tests {
             merged.iter().any(|i| i.text.contains("ar")),
             "{:?}",
             merged.iter().map(|i| i.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two columns whose baselines do not line up, as a Federal Register
+    /// contents page sets them: a left column line falls between the right
+    /// column's wrapped line and the entry number one line below it, and the
+    /// left line is painted first. The band must not reach both right-column
+    /// baselines, or the x sort lays the number beside the wrapped line and
+    /// the walk glues them into "1.381must the detained ...".
+    /// Modelled on `21 CFR Ch. I (4-1-24 Edition)` p.2.
+    #[test]
+    fn line_band_stops_at_one_baseline_per_column() {
+        let items = vec![
+            make_item_fs("1.326", 138.57, 528.05, 14.90, 6.39),
+            make_item_fs(
+                "Who is subject to this subpart? ",
+                159.87,
+                528.05,
+                106.56,
+                6.39,
+            ),
+            make_item_fs(
+                "must the detained article of food be held? ",
+                315.77,
+                532.43,
+                142.89,
+                6.39,
+            ),
+            make_item_fs("1.381", 302.98, 525.31, 14.92, 6.39),
+            make_item_fs(
+                "May a detained article of food be de-",
+                324.29,
+                525.31,
+                132.28,
+                6.39,
+            ),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(
+            merged.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+            vec![
+                "1.326",
+                "Who is subject to this subpart? ",
+                "must the detained article of food be held? ",
+                "1.381",
+                "May a detained article of food be de-",
+            ]
         );
     }
 
