@@ -40,25 +40,41 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     // fixes the OUTPUT ORDER only — stream-order line assembly downstream
     // depends on it — while script detection below is purely geometric and
     // so also reaches markers raised further than 5pt on large type.
+    //
+    // The window bounds the group's whole y span, not only its founding item:
+    // a window anchored on one column's baseline otherwise reaches a line above
+    // it in the other column and a line below it, and the x sort then reorders
+    // those two baselines into one. A script run reaches past that span on
+    // purpose — detection below reads the runs it is adjacent to — and is
+    // recognized by its geometry (see `script_attachable_to`).
     let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<TextItem>)> = Vec::new();
+    // (page, founding y, y span low, y span high, items)
+    let mut line_groups: Vec<(u32, f32, f32, f32, Vec<TextItem>)> = Vec::new();
 
     for item in items {
         let found = line_groups
             .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
+            .find(|(pg, founding_y, y_low, y_high, group)| {
+                *pg == item.page
+                    && ((item.y - *y_low).abs() < y_tolerance
+                        && (item.y - *y_high).abs() < y_tolerance
+                        || (item.y - *founding_y).abs() < y_tolerance
+                            && script_attachable_to(&item, group.iter()))
+            });
+        if let Some((_, _, y_low, y_high, group)) = found {
+            *y_low = y_low.min(item.y);
+            *y_high = y_high.max(item.y);
             group.push(item);
         } else {
             let page = item.page;
             let y = item.y;
-            line_groups.push((page, y, vec![item]));
+            line_groups.push((page, y, y, y, vec![item]));
         }
     }
 
     let mut ordered: Vec<TextItem> =
-        Vec::with_capacity(line_groups.iter().map(|(_, _, g)| g.len()).sum());
-    for (_, _, mut group) in line_groups {
+        Vec::with_capacity(line_groups.iter().map(|(_, _, _, _, g)| g.len()).sum());
+    for (_, _, _, _, mut group) in line_groups {
         group.sort_by(|a, b| a.x.total_cmp(&b.x));
         ordered.extend(group);
     }
@@ -100,6 +116,35 @@ const SCRIPT_MAX_GLYPH_LETTERS: usize = 4;
 /// Digit-only runs up to this many digits fuse into the anchor as Unicode
 /// super/subscript characters.
 const SCRIPT_MAX_FUSED_DIGITS: usize = 4;
+
+/// Whether `item` could be the super/subscript of a member of a line band:
+/// shrunken to [`SCRIPT_MIN_RATIO`]..=[`SCRIPT_MAX_RATIO`] of that member's
+/// size and tightly attached to its side, the geometry `detect_script_runs`
+/// looks for below.
+///
+/// Such a run sits off the baseline it annotates, so a band has to reach past
+/// its y span to keep the two together — detection reads each item's
+/// neighbours. The line below a band's own is set in the band's size and only
+/// ever meets it by accident, so it stays out.
+pub(crate) fn script_attachable_to<'a>(
+    item: &TextItem,
+    band: impl IntoIterator<Item = &'a TextItem>,
+) -> bool {
+    band.into_iter().any(|member| {
+        let anchor = member.font_size;
+        if anchor <= 0.0 || item.font_size <= 0.0 {
+            return false;
+        }
+        let ratio = item.font_size / anchor;
+        if !(SCRIPT_MIN_RATIO..=SCRIPT_MAX_RATIO).contains(&ratio) {
+            return false;
+        }
+        let attached = |gap: f32| {
+            (-anchor * SCRIPT_ATTACH_OVERLAP..=anchor * SCRIPT_ATTACH_GAP).contains(&gap)
+        };
+        attached(item.x - (member.x + member.width)) || attached(member.x - (item.x + item.width))
+    })
+}
 
 /// A glyph run detected as the super/subscript of `anchor`.
 #[derive(Debug)]
@@ -515,6 +560,51 @@ mod tests {
 
     fn texts(items: &[TextItem]) -> Vec<&str> {
         items.iter().map(|i| i.text.as_str()).collect()
+    }
+
+    /// The rough-line window reorders items, so it must not reach two
+    /// baselines of one column either: on a contents page whose columns sit on
+    /// offset baselines it would otherwise lay the next entry's number beside
+    /// the wrapped line above it. Modelled on `21 CFR Ch. I` p.2, the items as
+    /// `merge_text_items` leaves them.
+    #[test]
+    fn rough_line_window_stops_at_one_baseline_per_column() {
+        let items = vec![
+            make_item_fs("1.326", 138.57, 528.05, 14.90, 6.39),
+            make_item_fs(
+                "Who is subject to this subpart? ",
+                159.87,
+                528.05,
+                106.56,
+                6.39,
+            ),
+            make_item_fs(
+                "must the detained article of food be held? ",
+                315.77,
+                532.43,
+                142.89,
+                6.39,
+            ),
+            make_item_fs("1.381", 302.98, 525.31, 14.92, 6.39),
+            make_item_fs(
+                "May a detained article of food be de-",
+                324.29,
+                525.31,
+                132.28,
+                6.39,
+            ),
+        ];
+        let ordered = merge_subscript_items(items);
+        assert_eq!(
+            texts(&ordered),
+            vec![
+                "1.326",
+                "Who is subject to this subpart? ",
+                "must the detained article of food be held? ",
+                "1.381",
+                "May a detained article of food be de-",
+            ]
+        );
     }
 
     #[test]

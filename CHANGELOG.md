@@ -11,6 +11,14 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- A line band no longer reaches two baselines of one column. Bands were bounded
+  against their founding item, so on a page whose columns sit on offset
+  baselines an item of one column could found a band that reached a line above
+  it and a line below it in the other; the x sort then interleaved the two
+  baselines into one line and the merge walk glued the runs that met ("1.381"
+  and the wrapped line above it came out as "1.381must the detained ..."). A
+  band now bounds its whole y span, and a super/subscript run still straddles
+  it on the attachment geometry script detection already looks for.
 - A contents page whose entries end in right-aligned page numbers without dot
   leaders — an edited volume's table of contents with the chapter authors on
   their own lines — is rendered as a contents list, one entry per line with
