@@ -3028,8 +3028,15 @@ impl FontCMaps {
             if !is_form {
                 continue;
             }
-            // Collect fonts from this Form XObject's Resources
-            if let Ok(form_resources) = stream.dict.get(b"Resources").and_then(Object::as_dict) {
+            // Collect fonts from this Form XObject's Resources. `/Resources` is
+            // frequently an indirect reference here (one shared resources dict
+            // reused by several forms), so resolve it before falling back.
+            let form_resources = match stream.dict.get(b"Resources") {
+                Ok(Object::Reference(resources_id)) => doc.get_dictionary(*resources_id).ok(),
+                Ok(Object::Dictionary(dictionary)) => Some(dictionary),
+                _ => None,
+            };
+            if let Some(form_resources) = form_resources {
                 // Extract font dict from the Form's resources
                 let font_dict_obj = match form_resources.get(b"Font") {
                     Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
@@ -3303,6 +3310,73 @@ endcmap
         assert_eq!(cmap.lookup(0x0003), Some(" ".to_string()));
         assert_eq!(cmap.lookup(0x0024), Some("A".to_string()));
         assert_eq!(cmap.lookup(0x0025), Some("B".to_string()));
+    }
+
+    /// A Form XObject whose `/Resources` is an indirect reference (the common
+    /// "one shared resources dict, many forms" layout) must still contribute
+    /// its fonts' ToUnicode CMaps. Missing them silently downgrades every font
+    /// inside the form to raw code bytes.
+    #[test]
+    fn form_xobject_with_indirect_resources_contributes_font_cmaps() {
+        let mut doc = Document::new();
+
+        let tounicode_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"beginbfchar\n<41> <0041>\nendbfchar\n".to_vec(),
+        )));
+
+        let mut font = lopdf::Dictionary::new();
+        font.set("Type", "Font");
+        font.set("Subtype", "TrueType");
+        font.set("BaseFont", "SUBSET+Times-Roman");
+        font.set("ToUnicode", Object::Reference(tounicode_id));
+        let font_id = doc.add_object(Object::Dictionary(font));
+
+        let mut form_font_dict = lopdf::Dictionary::new();
+        form_font_dict.set("F1", Object::Reference(font_id));
+        let mut form_resources = lopdf::Dictionary::new();
+        form_resources.set("Font", Object::Dictionary(form_font_dict));
+        let form_resources_id = doc.add_object(Object::Dictionary(form_resources));
+
+        let mut form = lopdf::Dictionary::new();
+        form.set("Type", "XObject");
+        form.set("Subtype", "Form");
+        form.set("BBox", vec![0.into(), 0.into(), 100.into(), 100.into()]);
+        form.set("Resources", Object::Reference(form_resources_id));
+        let form_id = doc.add_object(Object::Stream(lopdf::Stream::new(form, Vec::new())));
+
+        let mut xobjects = lopdf::Dictionary::new();
+        xobjects.set("Fm0", Object::Reference(form_id));
+        let mut page_resources = lopdf::Dictionary::new();
+        page_resources.set("XObject", Object::Dictionary(xobjects));
+
+        let mut page = lopdf::Dictionary::new();
+        page.set("Type", "Page");
+        page.set("MediaBox", vec![0.into(), 0.into(), 612.into(), 792.into()]);
+        page.set("Resources", Object::Dictionary(page_resources));
+        let page_id = doc.add_object(Object::Dictionary(page));
+
+        let mut pages = lopdf::Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Count", 1);
+        pages.set("Kids", vec![Object::Reference(page_id)]);
+        let pages_id = doc.add_object(Object::Dictionary(pages));
+        doc.get_object_mut(page_id)
+            .and_then(Object::as_dict_mut)
+            .unwrap()
+            .set("Parent", Object::Reference(pages_id));
+
+        let mut catalog = lopdf::Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let cmaps = FontCMaps::from_doc(&doc);
+        let entry = cmaps
+            .get_by_obj(tounicode_id.0)
+            .expect("font inside a form with indirect /Resources must be collected");
+        assert_eq!(entry.primary.lookup(0x41).as_deref(), Some("A"));
     }
 
     #[test]

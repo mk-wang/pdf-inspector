@@ -156,6 +156,57 @@ fn positioned_blocks_for_page<'a>(
     blocks
 }
 
+/// Pages whose body is set in a single monospace face throughout.
+///
+/// `line_is_monospace` reads one line in isolation, where a mono run against
+/// proportional prose is a code listing. A page that is monospace from top to
+/// bottom has no such contrast — the face is the body typography, and font
+/// alone stops being evidence of code. This is the normal shape of a scanned
+/// book: its invisible (Tr 3) OCR text layer is written in Courier, so without
+/// this guard every paragraph of a novel converts to a fenced code block. On
+/// such a page only a line that also reads like code opens a fence.
+fn wholly_monospace_pages(lines: &[TextLine]) -> HashSet<u32> {
+    let mut per_page: HashMap<u32, (usize, usize)> = HashMap::new();
+    for line in lines {
+        let entry = per_page.entry(line.page).or_insert((0, 0));
+        for item in &line.items {
+            let chars = item.text.trim().chars().count();
+            if chars == 0 {
+                continue;
+            }
+            entry.1 += chars;
+            if super::classify::is_monospace_font(&item.font) {
+                entry.0 += chars;
+            }
+        }
+    }
+    per_page
+        .into_iter()
+        .filter(|(_, (monospace, total))| *total > 0 && monospace * 10 >= total * 9)
+        .map(|(page, _)| page)
+        .collect()
+}
+
+/// Whether a text line opens a code block from its font alone.
+fn line_opens_code_block(
+    line: &TextLine,
+    wholly_monospace: &HashSet<u32>,
+) -> bool {
+    if !super::classify::line_is_monospace(line) {
+        return false;
+    }
+    if !wholly_monospace.contains(&line.page) {
+        return true;
+    }
+    let text: String = line
+        .items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    super::classify::is_code_like(&text)
+}
+
 /// Pre-scan struct heading tags to find levels that are overused — i.e., tagged on
 /// so many lines that they clearly represent body text, not real headings.
 /// Returns the set of heading levels (1–6) that should be suppressed.
@@ -781,6 +832,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         return String::new();
     }
 
+    let wholly_monospace = wholly_monospace_pages(&lines);
+
     // Calculate font statistics
     let font_stats = calculate_font_stats(&lines);
     let base_size = options
@@ -1065,8 +1118,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::Code))
             || (options.detect_code
-                && (in_code_block || !in_paragraph)
-                && super::classify::line_is_monospace(line));
+                && if in_code_block {
+                    super::classify::line_is_monospace(line)
+                } else {
+                    !in_paragraph && line_opens_code_block(line, &wholly_monospace)
+                });
         if !in_code_block
             && !is_code_line
             && !is_para_break
@@ -1460,6 +1516,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         return String::new();
     }
 
+    let wholly_monospace = wholly_monospace_pages(&lines);
+
     // Calculate font statistics
     let font_stats = calculate_font_stats(&lines);
     let base_size = options
@@ -1703,7 +1761,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // Detect code blocks by font. Only at a paragraph boundary — a
         // mono-set line continuing an open prose paragraph is an inline
         // code literal's style smeared across a wrapped line, not code.
-        if options.detect_code && !in_paragraph && super::classify::line_is_monospace(line) {
+        if options.detect_code && !in_paragraph && line_opens_code_block(line, &wholly_monospace) {
             // Use plain text for code blocks
             output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
             continue;
@@ -2945,6 +3003,56 @@ mod tests {
         assert!(
             !md.contains("Introduction.."),
             "a period is not a leader:\n{md}"
+        );
+    }
+
+    #[test]
+    fn code_block_continuation_on_wholly_monospace_page_not_interrupted_by_plain_comment() {
+        let mut line1_item = make_item("fn main() {", 1, None);
+        line1_item.font = "Courier".to_string();
+        line1_item.y = 700.0;
+        let line1 = make_line(vec![line1_item]);
+
+        let mut line2_item = make_item("// this is a normal comment line without symbols", 1, None);
+        line2_item.font = "Courier".to_string();
+        line2_item.y = 685.0;
+        let line2 = make_line(vec![line2_item]);
+
+        let mut line3_item = make_item("    let x = 42;", 1, None);
+        line3_item.font = "Courier".to_string();
+        line3_item.y = 670.0;
+        let line3 = make_line(vec![line3_item]);
+
+        let mut line4_item = make_item("}", 1, None);
+        line4_item.font = "Courier".to_string();
+        line4_item.y = 655.0;
+        let line4 = make_line(vec![line4_item]);
+
+        let lines = vec![line1, line2, line3, line4];
+
+        let options = MarkdownOptions {
+            detect_code: true,
+            ..MarkdownOptions::default()
+        };
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            options,
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            None,
+        );
+
+        assert!(
+            md.contains("```\nfn main() {\n// this is a normal comment line without symbols\nlet x = 42;\n}\n```"),
+            "Expected all 4 lines to be preserved in a single continuous code block, but got:\n{md}"
+        );
+        assert_eq!(
+            md.matches("```").count(),
+            2,
+            "Expected exactly one opening and one closing code fence, but got:\n{md}"
         );
     }
 }

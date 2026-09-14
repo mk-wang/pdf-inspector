@@ -419,6 +419,81 @@ pub fn process_loaded_document_with_options(
 }
 
 // =========================================================================
+// Encryption / authentication
+// =========================================================================
+
+/// How a loaded document stands with respect to its security handler.
+///
+/// The distinction that matters to callers is
+/// [`AuthenticationRequired`](Self::AuthenticationRequired): such a document
+/// carries no usable content at all, so anything derived from it (page counts,
+/// detection results, markdown) is meaningless rather than merely empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentAuthentication {
+    /// The trailer declares no `/Encrypt`; there is nothing to unlock.
+    NotEncrypted,
+    /// Encrypted and authenticated: strings and streams are plaintext.
+    Authenticated,
+    /// Encrypted and **not** authenticated. Every string and stream in this
+    /// document is still ciphertext and lopdf left the object map empty, so the
+    /// page tree, content streams and fonts are all unreachable and
+    /// `get_pages()` reports zero pages. Re-load with
+    /// [`load_document_bytes_with_password`] before processing.
+    AuthenticationRequired,
+}
+
+/// Classify a loaded document's authentication state.
+///
+/// lopdf strips `/Encrypt` from the trailer once it has decrypted a document,
+/// so a successfully authenticated document reports
+/// [`Authenticated`](DocumentAuthentication::Authenticated) rather than
+/// [`NotEncrypted`](DocumentAuthentication::NotEncrypted) — the two are not
+/// interchangeable for audit purposes.
+pub fn document_authentication(document: &Document) -> DocumentAuthentication {
+    if document.was_encrypted() {
+        DocumentAuthentication::Authenticated
+    } else if document.is_encrypted() {
+        DocumentAuthentication::AuthenticationRequired
+    } else {
+        DocumentAuthentication::NotEncrypted
+    }
+}
+
+/// Load a PDF from memory, authenticating with exactly `password`.
+///
+/// This is the loader for callers that own the encryption policy — the ones
+/// that keep the parsed document and hand it to [`prepare_hybrid_markdown`] or
+/// [`process_loaded_document_with_options`]. Unlike [`PdfOptions::password`],
+/// `password` is never defaulted: `None` attempts nothing, so an encrypted
+/// document fails with [`PdfError::Encrypted`] instead of being opened with an
+/// empty password the caller never asked for. `Some("")` explicitly requests
+/// the PDF spec's empty user password, which is what MuPDF and poppler use when
+/// they open a file without being prompted.
+///
+/// The returned document is fully decrypted, and [`document_authentication`]
+/// reports [`Authenticated`](DocumentAuthentication::Authenticated) for it.
+pub fn load_document_bytes_with_password(
+    bytes: &[u8],
+    password: Option<&str>,
+    max_decompressed_size: Option<usize>,
+) -> Result<Document, PdfError> {
+    load_document_bytes_with_credential(bytes, password, max_decompressed_size).map_err(PdfError::from)
+}
+
+/// Reject a document that still needs authentication.
+///
+/// Guards the entry points that accept an already-loaded document from the
+/// caller: an unauthenticated document has an empty object map, which every
+/// downstream stage reads as "no text" and reports as a zero-page scan. Failing
+/// loudly is the only outcome that does not misrepresent the file.
+pub(crate) fn ensure_authenticated(document: &Document) -> Result<(), PdfError> {
+    match document_authentication(document) {
+        DocumentAuthentication::AuthenticationRequired => Err(PdfError::Encrypted),
+        _ => Ok(()),
+    }
+}
+
+// =========================================================================
 // Deprecated compat shims
 // =========================================================================
 
@@ -4155,46 +4230,71 @@ fn bounded_load_options(max_decompressed_size: Option<usize>) -> lopdf::LoadOpti
     }
 }
 
+/// Load PDF bytes with pdf-inspector's documented [`PdfOptions::password`]
+/// default: an omitted password means the PDF spec's empty user password
+/// (owner-only encryption), and a supplied password the document rejects also
+/// retries the empty one. MuPDF and poppler open such files the same way.
 fn load_document_bytes(
     buf: &[u8],
     password: Option<&str>,
     max_decompressed_size: Option<usize>,
 ) -> Result<Document, lopdf::Error> {
-    match Document::load_mem_with_options(buf, bounded_load_options(max_decompressed_size)) {
-        // Some encrypted PDFs load structurally but leave their streams
-        // encrypted (`is_encrypted()` stays true); reading them yields garbage
-        // until we re-load with a password. Others fail load_mem outright with
-        // an encryption error. Handle both by re-loading with the password.
-        Ok(doc) if doc.is_encrypted() => {
-            decrypt_document_bytes(buf, password, max_decompressed_size)
+    let supplied = password.unwrap_or("");
+    match load_document_bytes_with_credential(buf, Some(supplied), max_decompressed_size) {
+        Err(first) if !supplied.is_empty() => {
+            load_document_bytes_with_credential(buf, Some(""), max_decompressed_size)
+                .map_err(|_| first)
         }
-        Ok(doc) => Ok(doc),
-        Err(error) if is_encrypted_lopdf_error(&error) => {
-            decrypt_document_bytes(buf, password, max_decompressed_size)
-        }
-        Err(error) => Err(error),
+        result => result,
     }
 }
 
-/// Re-load an encrypted PDF, decrypting with `password`. Falls back to the
-/// empty password (owner-only encryption, the common "protected" case) when a
-/// non-empty password was supplied but rejected.
-fn decrypt_document_bytes(
+/// Load PDF bytes with the credential the caller supplied, verbatim.
+///
+/// No credential is invented here: `None` attempts no password at all, so a
+/// document protected by any credential — including the PDF spec's empty user
+/// password — fails rather than coming back as a pageless document. `Some("")`
+/// is how a caller explicitly asks for the empty user password.
+///
+/// Failing is the point. When lopdf has no usable password it abandons
+/// `Document::load` before parsing a single object, and either returns a
+/// document whose object map is empty (no page tree, no content streams, no
+/// fonts, `get_pages()` reports zero) or an encryption error. Both states are
+/// indistinguishable downstream from "this PDF has no text", so they must not
+/// escape this function as a successful load.
+fn load_document_bytes_with_credential(
     buf: &[u8],
     password: Option<&str>,
     max_decompressed_size: Option<usize>,
 ) -> Result<Document, lopdf::Error> {
-    let pw = password.unwrap_or("");
-    let with_password = |pw: &str| lopdf::LoadOptions {
-        password: Some(pw.to_string()),
-        ..bounded_load_options(max_decompressed_size)
+    let load = |password: Option<&str>| {
+        Document::load_mem_with_options(
+            buf,
+            lopdf::LoadOptions {
+                password: password.map(str::to_string),
+                ..bounded_load_options(max_decompressed_size)
+            },
+        )
     };
-    match Document::load_mem_with_options(buf, with_password(pw)) {
-        Ok(doc) => Ok(doc),
-        Err(inner) if !pw.is_empty() => {
-            Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)
+
+    // A credential-free probe separates plaintext documents from encrypted
+    // ones; only the latter need the caller's credential.
+    let probe = load(None);
+    let needs_credential = match &probe {
+        Ok(document) => {
+            document_authentication(document) == DocumentAuthentication::AuthenticationRequired
         }
-        Err(inner) => Err(inner),
+        Err(error) => is_encrypted_lopdf_error(error),
+    };
+    if !needs_credential {
+        return probe;
+    }
+
+    match password {
+        Some(password) => load(Some(password)),
+        None => Err(lopdf::Error::Unimplemented(
+            "PDF is encrypted and requires a password",
+        )),
     }
 }
 
@@ -7605,6 +7705,110 @@ mod tests {
     fn recover_startxref_pointer_returns_none_without_a_valid_table() {
         let buf = b"Please refer to the xref appendix for details.";
         assert!(recover_startxref_pointer(buf).is_none());
+    }
+
+    /// `encrypted-empty-user-password.pdf` is a self-generated stand-in for the
+    /// real-world "protected" shape (Standard/AESV2, xref stream, object
+    /// streams) whose user password is the empty string — the case MuPDF and
+    /// poppler open without prompting. lopdf cannot guess that: given no
+    /// credential it abandons the parse, returns a document with an empty
+    /// object map, and `get_pages()` reports zero pages. Classifying that
+    /// emptiness produced a confident `Scanned` verdict and a zero-byte
+    /// markdown; it must fail instead.
+    #[test]
+    fn unauthenticated_encrypted_document_fails_instead_of_reporting_a_scan() {
+        let bytes = std::fs::read("tests/fixtures/encrypted-empty-user-password.pdf").unwrap();
+
+        let raw = Document::load_mem(&bytes).expect("the container parses without a credential");
+        assert_eq!(
+            document_authentication(&raw),
+            DocumentAuthentication::AuthenticationRequired
+        );
+        assert!(raw.get_pages().is_empty());
+
+        let detection =
+            detector::detect_from_document_with_limit(&raw, 0, &DetectionConfig::default(), None);
+        assert!(
+            matches!(detection, Err(PdfError::Encrypted)),
+            "detection must refuse an unauthenticated document, got {detection:?}"
+        );
+
+        let processed = process_loaded_document_with_options(&raw, PdfOptions::new());
+        assert!(
+            matches!(processed, Err(PdfError::Encrypted)),
+            "processing must refuse an unauthenticated document, got {processed:?}"
+        );
+    }
+
+    #[test]
+    fn empty_user_password_must_be_requested_explicitly() {
+        let bytes = std::fs::read("tests/fixtures/encrypted-empty-user-password.pdf").unwrap();
+
+        // No credential supplied: none is invented.
+        assert!(matches!(
+            load_document_bytes_with_password(&bytes, None, None),
+            Err(PdfError::Encrypted)
+        ));
+        // A rejected credential is not silently downgraded to the empty one.
+        assert!(matches!(
+            load_document_bytes_with_password(&bytes, Some("wrong"), None),
+            Err(PdfError::Encrypted)
+        ));
+
+        // Asking for the empty user password explicitly opens the document.
+        let doc = load_document_bytes_with_password(&bytes, Some(""), None).unwrap();
+        assert_eq!(
+            document_authentication(&doc),
+            DocumentAuthentication::Authenticated
+        );
+        assert_eq!(doc.get_pages().len(), 1);
+        let markdown = process_loaded_document_with_options(&doc, PdfOptions::new())
+            .unwrap()
+            .markdown
+            .expect("an authenticated document must produce markdown");
+        assert!(
+            markdown.contains("EncryptedFixtureSentinel"),
+            "expected the decrypted text, got {markdown:?}"
+        );
+
+        // `PdfOptions::password` keeps its documented default (an omitted
+        // password means the empty user password); the credential-free contract
+        // above belongs to callers that own the encryption policy.
+        let via_options = process_pdf_with_options(
+            "tests/fixtures/encrypted-empty-user-password.pdf",
+            PdfOptions::new(),
+        )
+        .unwrap();
+        assert!(
+            via_options
+                .markdown
+                .unwrap_or_default()
+                .contains("EncryptedFixtureSentinel")
+        );
+    }
+
+    #[test]
+    fn password_protected_document_still_requires_its_password() {
+        let bytes = std::fs::read("tests/fixtures/encrypted-secret123.pdf").unwrap();
+
+        assert!(matches!(
+            load_document_bytes_with_password(&bytes, Some(""), None),
+            Err(PdfError::Encrypted)
+        ));
+
+        let doc = load_document_bytes_with_password(&bytes, Some("secret123"), None).unwrap();
+        assert_eq!(
+            document_authentication(&doc),
+            DocumentAuthentication::Authenticated
+        );
+        let markdown = process_loaded_document_with_options(&doc, PdfOptions::new())
+            .unwrap()
+            .markdown
+            .expect("an authenticated document must produce markdown");
+        assert!(
+            markdown.contains("Procurement"),
+            "expected the decrypted text, got {markdown:?}"
+        );
     }
 }
 

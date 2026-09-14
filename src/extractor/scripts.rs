@@ -47,34 +47,45 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     // those two baselines into one. A script run reaches past that span on
     // purpose — detection below reads the runs it is adjacent to — and is
     // recognized by its geometry (see `script_attachable_to`).
+    //
+    // That attachment is measured against the band's members, never off the
+    // founding item: a formula's band is often founded by one of its own
+    // scripts — the "−" of "−0.5" sits above the baseline its sibling
+    // subscription belongs to — and a window read off that founder rejects
+    // the sibling, which then founds a band of its own and lands after the
+    // whole formula. The two halves stay independent, as before: the run need
+    // only be level with SOME member and attached to SOME member (which may be
+    // different members when the band spans multiple baselines).
     let y_tolerance = 5.0;
-    // (page, founding y, y span low, y span high, items)
-    let mut line_groups: Vec<(u32, f32, f32, f32, Vec<TextItem>)> = Vec::new();
+    // (page, y span low, y span high, items)
+    let mut line_groups: Vec<(u32, f32, f32, Vec<TextItem>)> = Vec::new();
 
     for item in items {
         let found = line_groups
             .iter_mut()
-            .find(|(pg, founding_y, y_low, y_high, group)| {
+            .find(|(pg, y_low, y_high, group)| {
                 *pg == item.page
                     && ((item.y - *y_low).abs() < y_tolerance
                         && (item.y - *y_high).abs() < y_tolerance
-                        || (item.y - *founding_y).abs() < y_tolerance
-                            && script_attachable_to(&item, group.iter()))
+                        || (group
+                            .iter()
+                            .any(|member| (item.y - member.y).abs() < y_tolerance)
+                            && script_attachable_to(&item, group.iter())))
             });
-        if let Some((_, _, y_low, y_high, group)) = found {
+        if let Some((_, y_low, y_high, group)) = found {
             *y_low = y_low.min(item.y);
             *y_high = y_high.max(item.y);
             group.push(item);
         } else {
             let page = item.page;
             let y = item.y;
-            line_groups.push((page, y, y, y, vec![item]));
+            line_groups.push((page, y, y, vec![item]));
         }
     }
 
     let mut ordered: Vec<TextItem> =
-        Vec::with_capacity(line_groups.iter().map(|(_, _, _, _, g)| g.len()).sum());
-    for (_, _, _, _, mut group) in line_groups {
+        Vec::with_capacity(line_groups.iter().map(|(_, _, _, g)| g.len()).sum());
+    for (_, _, _, mut group) in line_groups {
         group.sort_by(|a, b| a.x.total_cmp(&b.x));
         ordered.extend(group);
     }
@@ -605,6 +616,50 @@ mod tests {
                 "May a detained article of food be de-",
             ]
         );
+    }
+
+    /// A run painted before its anchor's other members still has to land
+    /// beside its anchor. The band's fallback window is measured against the
+    /// band's members, so it must not be read off whichever item founded the
+    /// band: here the founder is a *script* of the same formula (`−` of
+    /// `−0.5`, 2.89pt above the body baseline) and the subscription "model"
+    /// sits 7.0pt below the founder but 2.89pt below the anchor it indexes.
+    /// Measured on the founder, "model" founds its own band and the x sort
+    /// parks it after the whole formula. Modelled on `Attention Is All You
+    /// Need` eq. (3), the items as `merge_text_items` leaves them.
+    #[test]
+    fn run_in_place_when_the_band_founder_is_its_own_script() {
+        let items = vec![
+            make_item_fs("−", 202.80, 169.08, 6.22, 6.97),
+            make_item_fs("lrate", 162.89, 164.97, 21.42, 9.96),
+            make_item_fs("=", 187.10, 164.97, 7.74, 9.96),
+            make_item_fs("d", 197.62, 164.97, 5.18, 9.96),
+            make_item_fs("model", 202.80, 162.08, 17.43, 6.97),
+            make_item_fs("·", 222.95, 164.97, 2.76, 9.96),
+        ];
+        let ordered = merge_subscript_items(items);
+        assert_eq!(
+            texts(&ordered),
+            vec!["lrate", "=", "d", "−", "model", "·"]
+        );
+    }
+
+    /// The two halves of the fallback stay independent: the run need only be
+    /// level with SOME member and attached to SOME member. When a line band
+    /// spans slightly offset baselines, the member keeping the run within
+    /// `y_tolerance` (here `A`) and the anchor it attaches to geometrically
+    /// (here `B`) can be different members. Measuring both against a single
+    /// member would reject the script and sort it after the whole line.
+    #[test]
+    fn script_window_and_attachment_may_come_from_different_members() {
+        let items = vec![
+            make_item_fs("A", 100.0, 262.0, 10.0, 12.0),
+            make_item_fs("B", 112.0, 260.0, 10.0, 12.0),
+            make_item_fs("k", 122.0, 265.5, 5.0, 7.0),
+            make_item_fs("C", 130.0, 261.0, 10.0, 12.0),
+        ];
+        let ordered = merge_subscript_items(items);
+        assert_eq!(texts(&ordered), vec!["A", "B", "k", "C"]);
     }
 
     #[test]

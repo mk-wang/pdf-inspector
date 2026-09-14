@@ -398,16 +398,46 @@ fn prepare_markdown_state(
             options.max_decompressed_size,
         );
 
-        if pdf_type == PdfType::Mixed {
+        // The visible-only pass can come back with no text at all on a document
+        // whose text is entirely hidden. A scanned book carries its OCR layer as
+        // an invisible (Tr 3) form XObject behind the page raster, and the
+        // detector counts those text operators as text — so the document
+        // classifies as text-based, converts to zero bytes, and requests no OCR.
+        // Retry with the invisible layer whenever the visible pass produced no
+        // text for the selection, not only for Mixed documents.
+        let selection_has_visible_text = match &result {
+            Ok(((items, _, _), _, _)) => items.iter().any(|item| {
+                !matches!(item.item_type, crate::types::ItemType::Image)
+                    && !item.text.trim().is_empty()
+                    && options
+                        .page_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.contains(&item.page))
+            }),
+            Err(_) => true,
+        };
+
+        if pdf_type == PdfType::Mixed || !selection_has_visible_text {
             match result {
                 Ok(((items, rects, lines), thresholds, gid_encoded_pages)) => {
+                    // `[Image: …]` items (ItemType::Image) are placeholders for
+                    // image XObjects, not text read from the page. Counting them
+                    // as the visible pass's output is how a fully rasterized
+                    // book with an invisible (Tr 3) OCR layer — every page a
+                    // scan plus its hidden text — looked "non-empty" and never
+                    // reached the retry below: the sample was `[Image: img14]`
+                    // and neither empty nor garbage, so 438 pages converted to
+                    // zero bytes. See the same reasoning in
+                    // `non_placeholder_alnum` (lib.rs), which already ignores
+                    // raster placeholders when judging invisible-layer coverage.
                     let sample: String = items
                         .iter()
                         .filter(|item| {
-                            options
-                                .page_filter
-                                .as_ref()
-                                .is_none_or(|filter| filter.contains(&item.page))
+                            !matches!(item.item_type, crate::types::ItemType::Image)
+                                && options
+                                    .page_filter
+                                    .as_ref()
+                                    .is_none_or(|filter| filter.contains(&item.page))
                         })
                         .take(200)
                         .map(|item| item.text.as_str())
@@ -587,11 +617,49 @@ fn prepare_markdown_state(
             pages_needing_ocr.push(page);
         }
     }
+    // A selected page whose items are all raster placeholders has no text a
+    // host can read: an illustration plate in a scanned book, a full-page
+    // chart, or a scan whose hidden text layer is absent. Converting it yields
+    // an empty page, which is indistinguishable from a page that really holds
+    // nothing — so route it to OCR explicitly instead of reporting a silent
+    // empty page as if it were native text. Pages that carry no items at all
+    // stay untouched: a genuinely blank page needs no OCR.
+    let raster_only_pages: Vec<u32> = {
+        let selected = |page: u32| {
+            options
+                .page_filter
+                .as_ref()
+                .is_none_or(|filter| filter.contains(&page))
+        };
+        let mut only_raster: HashSet<u32> = source_items
+            .iter()
+            .filter(|item| matches!(item.item_type, crate::types::ItemType::Image))
+            .map(|item| item.page)
+            .filter(|page| selected(*page))
+            .collect();
+        for item in &source_items {
+            if !matches!(item.item_type, crate::types::ItemType::Image) && !item.text.trim().is_empty()
+            {
+                only_raster.remove(&item.page);
+            }
+        }
+        let mut pages: Vec<u32> = only_raster.into_iter().collect();
+        pages.sort_unstable();
+        pages
+    };
+    for page in &raster_only_pages {
+        if !pages_needing_ocr.contains(page) {
+            pages_needing_ocr.push(*page);
+        }
+    }
     pages_needing_ocr.sort_unstable();
     pages_needing_ocr.dedup();
 
     let mut ocr_reasons_by_page = detection_ocr_reasons;
     merge_ocr_reasons(&mut ocr_reasons_by_page, rendered.ocr_reasons_by_page);
+    for page in &raster_only_pages {
+        add_ocr_reason(&mut ocr_reasons_by_page, *page, crate::OCR_REASON_SCANNED);
+    }
     let markdown = if all_gid { None } else { markdown };
 
     Ok(PreparedMarkdown {
@@ -745,7 +813,13 @@ impl PreparedMarkdown {
                     } else {
                         HybridMarkdownPageSource::Ocr
                     }
-                } else if self.source_items.iter().any(|item| item.page == page) {
+                } else if self.source_items.iter().any(|item| {
+                    item.page == page
+                        && !matches!(
+                            item.item_type,
+                            crate::types::ItemType::Image
+                        )
+                }) {
                     HybridMarkdownPageSource::NativeText
                 } else {
                     HybridMarkdownPageSource::Blank

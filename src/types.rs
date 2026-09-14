@@ -647,14 +647,22 @@ impl TextLine {
             return needs_space;
         }
 
-        // Detect subscript/superscript: smaller font size and/or Y offset
+        // Detect subscript/superscript: smaller font size and/or Y offset.
+        // A true subscript/superscript is tightly attached to its anchor;
+        // separated words (gap >= 0.25 em) must never have their word space suppressed.
         let font_ratio = item.font_size / prev_item.font_size;
         let reverse_font_ratio = prev_item.font_size / item.font_size;
         let y_diff = (item.y - prev_item.y).abs();
+        let max_font_size = item.font_size.max(prev_item.font_size);
+        let gap = if prev_item.x <= item.x {
+            item.x - (prev_item.x + prev_item.width)
+        } else {
+            prev_item.x - (item.x + item.width)
+        };
+        let is_tight_script = gap < max_font_size * 0.25;
 
-        let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
-        let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
-
+        let is_sub_super = font_ratio < 0.85 && y_diff > 1.0 && is_tight_script;
+        let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0 && is_tight_script;
         // Use position-based spacing detection
         let should_join = should_join_items(prev_item, item, single_char_threshold);
 
@@ -1030,5 +1038,36 @@ mod formatting_tests {
                 "upside_down at {rotation}"
             );
         }
+    }
+
+    #[test]
+    fn ocr_word_gap_with_jitter_and_size_variance_preserves_space() {
+        // Modelled on scanned OCR layer (e.g. PUB-PDF-02 p20 "all our service"):
+        // Word-per-Tj with slight font-size variance (4.78pt vs 5.82pt, ratio 0.82 < 0.85)
+        // and baseline jitter (~1.0pt, y_diff > 1.0pt), separated by a normal word gap (4.0pt).
+        // Must NOT be treated as a subscript/superscript; word space must be preserved.
+        let mut our = body("our", 108.0, 10.5);
+        our.font_size = 5.82;
+        our.y = 453.59;
+
+        let mut service = body("service,", 122.5, 23.0);
+        service.font_size = 4.78;
+        service.y = 452.58;
+
+        let line_forward = line(vec![our, service]);
+        assert_eq!(line_forward.text(), "our service,");
+
+        // Reverse case (was_sub_super): e.g. "tale, he" where previous word was smaller
+        // and shifted in baseline.
+        let mut tale = body("tale,", 58.5, 13.3);
+        tale.font_size = 4.45;
+        tale.y = 434.35;
+
+        let mut he = body("he", 76.3, 7.5);
+        he.font_size = 6.10;
+        he.y = 435.36;
+
+        let line_reverse = line(vec![tale, he]);
+        assert_eq!(line_reverse.text(), "tale, he");
     }
 }

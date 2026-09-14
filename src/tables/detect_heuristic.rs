@@ -1712,7 +1712,31 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
     // all structural validations (alignment, consistency, not key-value).
     // Also bypass for 2-column body-font tables with short cells (avg ≤40 chars),
     // which are likely definition/category lists, not paragraph text.
-    if pct_data > min_pct || num_cols >= 3 {
+    if pct_data > min_pct {
+        return true;
+    }
+    if num_cols >= 3 {
+        // A wide table with no data-like content is only legitimate if its cells
+        // are multi-word descriptive phrases (category lists, program descriptions).
+        // If the cells are predominantly single alphabetic words with zero data,
+        // it is prose text whose words happened to align across lines.
+        let mut single_alpha = 0usize;
+        let mut count = 0usize;
+        for row in cells.iter().skip(1) {
+            for cell in row {
+                let t = cell.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                count += 1;
+                if !t.contains(char::is_whitespace) && t.chars().all(|c| c.is_alphabetic()) {
+                    single_alpha += 1;
+                }
+            }
+        }
+        if pct_data == 0.0 && count >= 10 && single_alpha as f32 / count as f32 >= 0.50 {
+            return false;
+        }
         return true;
     }
     if num_cols == 2 && matches!(mode, TableDetectionMode::BodyFont) {
@@ -1836,10 +1860,49 @@ fn page_number_value(token: &str) -> Option<u32> {
 /// monotonic run is what separates a real TOC from an incidental 2-column
 /// numeric data table.
 pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
+    if cells.len() < 2 {
+        return false;
+    }
     let num_cols = cells.first().map(|r| r.len()).unwrap_or(0);
+    if num_cols == 4 {
+        if !cells.iter().all(|r| r.len() == 4) {
+            return false;
+        }
+        // 2-up TOC: left half (cols 0..=1) and right half (cols 2..=3) are both
+        // title+page lists running side-by-side.
+        let left: Vec<Vec<String>> = cells
+            .iter()
+            .map(|r| vec![r[0].clone(), r[1].clone()])
+            .collect();
+        let right: Vec<Vec<String>> = cells
+            .iter()
+            .map(|r| vec![r[2].clone(), r[3].clone()])
+            .collect();
+        if is_page_number_toc(&left) && is_page_number_toc(&right) {
+            return true;
+        }
+        // Single TOC with empty/leader middle columns (col 0 = title, col 3 = page).
+        let is_empty_or_dots = |s: &str| {
+            let t = s.trim();
+            t.is_empty() || t.chars().all(|c| c == '.' || c == '\u{2026}' || c.is_whitespace())
+        };
+        let middle_sparse = cells
+            .iter()
+            .all(|r| is_empty_or_dots(&r[1]) && is_empty_or_dots(&r[2]));
+        if middle_sparse {
+            let outer: Vec<Vec<String>> = cells
+                .iter()
+                .map(|r| vec![r[0].clone(), r[3].clone()])
+                .collect();
+            if is_page_number_toc(&outer) {
+                return true;
+            }
+        }
+        return false;
+    }
     // A page-number TOC is a narrow list (title + page, optionally a leader
     // column). Wider grids are data tables, not contents.
-    if !(2..=3).contains(&num_cols) || cells.len() < 2 {
+    if !(2..=3).contains(&num_cols) {
         return false;
     }
     // 3-4 row fragments (a chapter's sections split into their own grid)
@@ -1922,20 +1985,30 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
     }
     let last = num_cols - 1;
 
-    // No header row: a TOC's first row is already an entry, so its last cell is
-    // a page number. A data table's first row is a column header (non-numeric,
-    // or an empty units cell like "Category | ") — the tell that separates
-    // "Mineral | CEC" tables from real contents. Check the actual first row,
-    // not the first non-empty one, so a blank header cell still rejects.
+    // Header row or first entry: a TOC without headers starts with an entry
+    // (so its last cell is a page number). A headed TOC starts with "Page" or "Pages".
+    // A data table's first row has arbitrary column headers ("Category | Units").
     let first_last = cells[0].get(last).map(|s| s.trim()).unwrap_or("");
-    if page_number_value(clean_page_cell(first_last, has_leader_dots)).is_none() {
+    let first_is_page_header = first_last.eq_ignore_ascii_case("page")
+        || first_last.eq_ignore_ascii_case("pages")
+        || first_last.eq_ignore_ascii_case("p.")
+        || first_last.eq_ignore_ascii_case("pp.");
+    if !first_is_page_header
+        && page_number_value(clean_page_cell(first_last, has_leader_dots)).is_none()
+    {
         return false;
     }
+
+    let check_cells = if first_is_page_header {
+        &cells[1..]
+    } else {
+        cells
+    };
 
     // Last column: page numbers on ≥70% of filled rows; collect their values.
     let mut filled = 0u32;
     let mut page_vals: Vec<u32> = Vec::new();
-    for row in cells {
+    for row in check_cells {
         let cell = row.get(last).map(|s| s.trim()).unwrap_or("");
         if cell.is_empty() {
             continue;
@@ -1951,14 +2024,14 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
 
     // First column: mostly text titles (has alphabetic content). This rejects
     // numeric-vs-numeric grids.
-    let text_first = cells
+    let text_first = check_cells
         .iter()
         .filter(|row| {
             row.first()
                 .is_some_and(|c| c.chars().any(|ch| ch.is_alphabetic()))
         })
         .count();
-    if (text_first as f32) < 0.6 * cells.len() as f32 {
+    if (text_first as f32) < 0.6 * check_cells.len() as f32 {
         return false;
     }
 
@@ -3681,6 +3754,31 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn has_table_like_content_rejects_wide_single_word_prose() {
+        // Multi-column prose text where words happen to form a 5-column grid.
+        // Zero data/numeric content, all cells single alphabetic words.
+        // Must be rejected by has_table_like_content instead of bypassing
+        // on column count alone.
+        let cells = vec![
+            vec!["THE".into(), String::new(), "taste".into(), "of".into(), "the".into()],
+            vec!["world".into(), "which".into(), "has".into(), "veered".into(), "so".into()],
+            vec!["often".into(), "is".into(), "constant".into(), "enough".into(), "to".into()],
+            vec!["fairy".into(), "tales".into(), "The".into(), "children".into(), "to".into()],
+            vec!["whom".into(), "and".into(), "for".into(), "whom".into(), "they".into()],
+            vec!["are".into(), "told".into(), "represent".into(), "the".into(), "young".into()],
+            vec!["age".into(), "of".into(), "man".into(), "They".into(), "are".into()],
+            vec!["true".into(), "to".into(), "his".into(), "early".into(), "loves".into()],
+            vec!["they".into(), "have".into(), "his".into(), "unblunted".into(), "edge".into()],
+            vec!["of".into(), "belief".into(), "and".into(), "fresh".into(), "appetite".into()],
+            vec!["for".into(), "marvels".into(), "The".into(), "instinct".into(), "of".into()],
+        ];
+        assert!(
+            !has_table_like_content(&cells, TableDetectionMode::BodyFont),
+            "prose text with single words across 5 columns must not pass as table content"
+        );
+    }
     #[test]
     fn dot_leader_toc_accepts_short_inline_leaders() {
         // Index-style cells where the full "label ... number" pattern is
@@ -4024,6 +4122,17 @@ mod tests {
             vec!["Section B".into(), "see notes".into()],
             vec!["Section C".into(), "later".into()],
             vec!["Section D".into(), "TBD".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_handles_jagged_rows_without_panicking() {
+        // Jagged rows where row 0 has 4 columns but subsequent rows have fewer.
+        // Must not panic on out-of-bounds indexing in the 4-column branch.
+        let cells = vec![
+            vec!["Chapter 1".into(), "1".into(), "2".into(), "3".into()],
+            vec!["Chapter 2".into(), "4".into()],
         ];
         assert!(!is_page_number_toc(&cells));
     }

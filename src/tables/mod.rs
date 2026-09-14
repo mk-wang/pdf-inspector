@@ -429,26 +429,28 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
                 .filter(|i| i.x >= col.x_min && i.x < col.x_max)
                 .collect();
             if col_items.len() >= 2 {
-                // Sort by X and find the split point
-                let mut sorted: Vec<f32> = col_items.iter().map(|i| i.x).collect();
-                sorted.sort_by(|a, b| a.total_cmp(b));
-                // Split at the midpoint between the two items
-                let split_x = (sorted[0]
-                    + col_items.iter().find(|i| i.x == sorted[0]).unwrap().width
-                    + sorted[1])
-                    / 2.0;
-                new_columns.push(ColumnRegion {
-                    x_min: col.x_min,
-                    x_max: split_x,
-                });
-                new_columns.push(ColumnRegion {
-                    x_min: split_x,
-                    x_max: col.x_max,
-                });
-                did_split = true;
-            } else {
-                new_columns.push(col.clone());
+                let mut sorted_items = col_items.clone();
+                sorted_items.sort_by(|a, b| a.x.total_cmp(&b.x));
+                let right_of_first = sorted_items[0].x + sorted_items[0].width;
+                let left_of_second = sorted_items[1].x;
+                let gap = left_of_second - right_of_first;
+                let split_x = (right_of_first + left_of_second) / 2.0;
+                let w0 = split_x - col.x_min;
+                let w1 = col.x_max - split_x;
+                if gap >= 15.0 && w0 >= 30.0 && w1 >= 30.0 {
+                    new_columns.push(ColumnRegion {
+                        x_min: col.x_min,
+                        x_max: split_x,
+                    });
+                    new_columns.push(ColumnRegion {
+                        x_min: split_x,
+                        x_max: col.x_max,
+                    });
+                    did_split = true;
+                    continue;
+                }
             }
+            new_columns.push(col.clone());
         }
         if did_split {
             log::debug!(
@@ -679,6 +681,24 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
     }
     let max_col_items = *items_per_col.iter().max().unwrap_or(&0);
     if filled_cells > 0 && max_col_items as f32 / filled_cells as f32 > 0.60 {
+        return None;
+    }
+
+    // Reject tables with ghost/sparse columns: every column must have substantial
+    // content across the rows. In a 4+ column borderless table, an underpopulated
+    // column (e.g. 0-1 items across 20+ rows) indicates an alignment artifact
+    // or a multi-column text layout, not a genuine table.
+    let min_col_items = *items_per_col.iter().min().unwrap_or(&0);
+    let min_required = (row_ys.len() / 6).clamp(2, 5);
+    if min_col_items < min_required {
+        return None;
+    }
+
+    // Reject table-of-contents / index layouts: column-based table detection is
+    // for borderless data tables (specs, reference, exam grids). Contents lists
+    // and multi-column indices must fall back to normal text flow so columns read
+    // sequentially in reading order instead of interleaving rows horizontally.
+    if is_table_of_contents(&cells) || detect_heuristic::is_inline_leader_index(&cells) {
         return None;
     }
 
@@ -1772,6 +1792,58 @@ mod tests {
         assert!(
             md.contains("|Flexural Modulus||ASTM D790|1400|MPa|"),
             "{md}"
+        );
+    }
+
+    #[test]
+    fn test_column_builder_rejects_contents_page_with_sparse_columns() {
+        // A multi-column contents layout with running head "x FAIRY TALES" and "PAGE",
+        // left titles, left page numbers, right titles, and right page numbers.
+        // Should be rejected by try_build_table_from_columns so it falls back
+        // to normal sequential reading order.
+        let mut items = vec![
+            make_char("x", 25.0, 450.0, 10.0, 5.0),
+            make_char("FAIRY TALES", 48.0, 450.0, 10.0, 65.0),
+            make_char("PAGE", 180.0, 450.0, 10.0, 25.0),
+            make_char("PAGE", 380.0, 450.0, 10.0, 25.0),
+        ];
+        let left_entries = [
+            ("THE WONDERFUL SHEEP", "214"),
+            ("LITTLE THUMB", "231"),
+            ("THE FORTY THIEVES", "242"),
+            ("HANSEL AND GRETEL", "251"),
+            ("SNOW-WHITE AND ROSE-BED", "259"),
+            ("THE GOOSE-GIRL", "266"),
+            ("TOADS AND DIAMONDS", "274"),
+            ("PRINCE DARLING", "278"),
+            ("BLUE BEARD", "290"),
+            ("TRUSTY JOHN", "296"),
+        ];
+        let right_entries = [
+            ("THE BRAVE LITTLE TAILOR", "304"),
+            ("A VOYAGE TO LILLIPUT", "813"),
+            ("THE PRINCESS ON THE GLASS HILL", "332"),
+            ("THE STORY OF PRINCE AHMED", "342"),
+            ("THE HISTORY OF JACK", "374"),
+            ("THE BLACK BULL OF NORROWAY", "380"),
+            ("THE RED ETIN", "385"),
+            ("PLATES", "1"),
+            ("CINDERELLA'S FLIGHT", "70"),
+            ("THE PRINCE'S BRIDE", "172"),
+        ];
+        for (i, (title, page)) in left_entries.iter().enumerate() {
+            let y = 430.0 - (i as f32 * 20.0);
+            items.push(make_char(title, 25.0, y, 10.0, 120.0));
+            items.push(make_char(page, 180.0, y, 10.0, 20.0));
+        }
+        for (i, (title, page)) in right_entries.iter().enumerate() {
+            let y = 430.0 - (i as f32 * 20.0);
+            items.push(make_char(title, 220.0, y, 10.0, 120.0));
+            items.push(make_char(page, 380.0, y, 10.0, 20.0));
+        }
+        assert!(
+            try_build_table_from_columns(&items, 1).is_none(),
+            "contents list with multi-column TOC layout should not be detected as a table"
         );
     }
 

@@ -196,6 +196,16 @@ pub(crate) fn detect_from_document_with_limit(
     config: &DetectionConfig,
     max_decompressed_size: Option<usize>,
 ) -> Result<PdfTypeResult, PdfError> {
+    // An encrypted document that was never authenticated has an empty object
+    // map: `get_pages()` is empty and every content stream is still ciphertext.
+    // Sampling that produces zero text operators, which the classifier below
+    // reports as `Scanned` with confidence 0.9 — a confident, wrong answer that
+    // sends the whole document down the OCR/original-bytes path instead of
+    // telling the caller to authenticate. Refuse it here, at the single point
+    // every caller-provided document passes through, so no entry point can
+    // misreport it.
+    crate::ensure_authenticated(doc)?;
+
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
 
