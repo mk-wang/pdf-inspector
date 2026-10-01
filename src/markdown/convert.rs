@@ -188,10 +188,7 @@ fn wholly_monospace_pages(lines: &[TextLine]) -> HashSet<u32> {
 }
 
 /// Whether a text line opens a code block from its font alone.
-fn line_opens_code_block(
-    line: &TextLine,
-    wholly_monospace: &HashSet<u32>,
-) -> bool {
+fn line_opens_code_block(line: &TextLine, wholly_monospace: &HashSet<u32>) -> bool {
     if !super::classify::line_is_monospace(line) {
         return false;
     }
@@ -1617,8 +1614,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if trimmed.is_empty() {
             continue;
         }
-        if !is_para_break
-            && !(options.detect_code && super::classify::line_is_monospace(line))
+        if !(is_para_break || (options.detect_code && super::classify::line_is_monospace(line)))
             && is_leader_continuation(plain_trimmed)
             && extend_leader(&mut output, plain_trimmed)
         {

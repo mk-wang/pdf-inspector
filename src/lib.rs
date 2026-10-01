@@ -477,7 +477,8 @@ pub fn load_document_bytes_with_password(
     password: Option<&str>,
     max_decompressed_size: Option<usize>,
 ) -> Result<Document, PdfError> {
-    load_document_bytes_with_credential(bytes, password, max_decompressed_size).map_err(PdfError::from)
+    load_document_bytes_with_credential(bytes, password, max_decompressed_size)
+        .map_err(PdfError::from)
 }
 
 /// Reject a document that still needs authentication.
@@ -7779,12 +7780,10 @@ mod tests {
             PdfOptions::new(),
         )
         .unwrap();
-        assert!(
-            via_options
-                .markdown
-                .unwrap_or_default()
-                .contains("EncryptedFixtureSentinel")
-        );
+        assert!(via_options
+            .markdown
+            .unwrap_or_default()
+            .contains("EncryptedFixtureSentinel"));
     }
 
     #[test]
@@ -7905,7 +7904,7 @@ mod rotated_run_region_tests {
         // (most items at negative y); a clockwise frame is never inferred and
         // must be passed explicitly.
         assert_eq!(
-            infer_region_coord_space(&[header.clone()]),
+            infer_region_coord_space(std::slice::from_ref(&header)),
             RegionCoordSpace::Standard
         );
         assert_eq!(
@@ -7917,7 +7916,7 @@ mod rotated_run_region_tests {
             RegionCoordSpace::Standard
         );
         let strip = collect_text_in_region_in_frame(
-            &[header.clone()],
+            std::slice::from_ref(&header),
             570.0,
             80.0,
             600.0,
@@ -7927,7 +7926,7 @@ mod rotated_run_region_tests {
         );
         assert_eq!(strip, "HEADER");
         let misread = collect_text_in_region_in_frame(
-            &[header.clone()],
+            std::slice::from_ref(&header),
             570.0,
             80.0,
             600.0,

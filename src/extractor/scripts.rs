@@ -61,17 +61,14 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     let mut line_groups: Vec<(u32, f32, f32, Vec<TextItem>)> = Vec::new();
 
     for item in items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y_low, y_high, group)| {
-                *pg == item.page
-                    && ((item.y - *y_low).abs() < y_tolerance
-                        && (item.y - *y_high).abs() < y_tolerance
-                        || (group
-                            .iter()
-                            .any(|member| (item.y - member.y).abs() < y_tolerance)
-                            && script_attachable_to(&item, group.iter())))
-            });
+        let found = line_groups.iter_mut().find(|(pg, y_low, y_high, group)| {
+            *pg == item.page
+                && ((item.y - *y_low).abs() < y_tolerance && (item.y - *y_high).abs() < y_tolerance
+                    || (group
+                        .iter()
+                        .any(|member| (item.y - member.y).abs() < y_tolerance)
+                        && script_attachable_to(&item, group.iter())))
+        });
         if let Some((_, y_low, y_high, group)) = found {
             *y_low = y_low.min(item.y);
             *y_high = y_high.max(item.y);
@@ -638,10 +635,7 @@ mod tests {
             make_item_fs("·", 222.95, 164.97, 2.76, 9.96),
         ];
         let ordered = merge_subscript_items(items);
-        assert_eq!(
-            texts(&ordered),
-            vec!["lrate", "=", "d", "−", "model", "·"]
-        );
+        assert_eq!(texts(&ordered), vec!["lrate", "=", "d", "−", "model", "·"]);
     }
 
     /// The two halves of the fallback stay independent: the run need only be

@@ -938,34 +938,48 @@ fn test_non_code_text() {
 // ============================================================================
 
 #[test]
-fn test_monospace_font_names() {
+fn test_wholly_monospace_prose_is_not_fenced() {
     use pdf_inspector::markdown::to_markdown_from_items;
-    // Font names that contain the patterns in is_monospace_font
-    let monospace_fonts = [
-        "Courier",
-        "Consolas",
-        "Monaco",
-        "Menlo",
-        "Fira Code",
-        "JetBrains Mono",
-        "Inconsolata",
-        "DejaVu Sans Mono",
-        "Liberation Mono",
-        "Fixed",
-        "Terminal",
+    let items = vec![
+        make_text_item_with_font(
+            "A scanned page may use Courier for its OCR text.",
+            100.0,
+            700.0,
+            12.0,
+            "Courier",
+            1,
+        ),
+        make_text_item_with_font(
+            "That font alone does not turn ordinary prose into code.",
+            100.0,
+            685.0,
+            12.0,
+            "Courier",
+            1,
+        ),
     ];
-
-    for font in &monospace_fonts {
-        let items = vec![make_text_item_with_font(
-            "code", 100.0, 700.0, 12.0, font, 1,
-        )];
-        let md = to_markdown_from_items(items, MarkdownOptions::default());
-        assert!(
-            md.contains("```"),
-            "Font not detected as monospace: {}",
-            font
-        );
-    }
+    let md = to_markdown_from_items(items, MarkdownOptions::default());
+    assert!(md.contains("A scanned page may use Courier for its OCR text."));
+    assert!(md.contains("That font alone does not turn ordinary prose into code."));
+    assert!(
+        !md.contains("```"),
+        "a wholly monospaced prose page is not code: {md}"
+    );
+}
+#[test]
+fn test_p1244_employer_omb_words_remain_separated() {
+    let markdown = pdf_inspector::process_pdf("tests/fixtures/p1244-1996.pdf")
+        .unwrap()
+        .markdown
+        .unwrap();
+    assert!(
+        markdown.contains("Employer OMB No. 1545-0065"),
+        "expected the separated Employer and OMB label: {markdown}"
+    );
+    assert!(
+        !markdown.contains("EmployerOMB"),
+        "the separated Employer and OMB label must not be glued: {markdown}"
+    );
 }
 
 // ============================================================================
@@ -1312,11 +1326,6 @@ fn test_snapshot_thermo_freon12() {
 #[test]
 fn test_snapshot_td9264() {
     assert_snapshot("td9264");
-}
-
-#[test]
-fn test_snapshot_p1244() {
-    assert_snapshot("p1244-1996");
 }
 
 #[test]
