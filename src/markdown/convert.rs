@@ -1614,8 +1614,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if trimmed.is_empty() {
             continue;
         }
-        if !is_para_break
-            && !(options.detect_code && super::classify::line_is_monospace(line))
+        if !(is_para_break || (options.detect_code && super::classify::line_is_monospace(line)))
             && is_leader_continuation(plain_trimmed)
             && extend_leader(&mut output, plain_trimmed)
         {

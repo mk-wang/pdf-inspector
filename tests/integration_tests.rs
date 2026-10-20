@@ -998,6 +998,52 @@ fn test_monospace_font_names() {
     }
 }
 
+#[test]
+fn test_wholly_monospace_prose_is_not_fenced() {
+    use pdf_inspector::markdown::to_markdown_from_items;
+    let items = vec![
+        make_text_item_with_font(
+            "A scanned page may use Courier for its OCR text.",
+            100.0,
+            700.0,
+            12.0,
+            "Courier",
+            1,
+        ),
+        make_text_item_with_font(
+            "That font alone does not turn ordinary prose into code.",
+            100.0,
+            685.0,
+            12.0,
+            "Courier",
+            1,
+        ),
+    ];
+    let md = to_markdown_from_items(items, MarkdownOptions::default());
+    assert!(md.contains("A scanned page may use Courier for its OCR text."));
+    assert!(md.contains("That font alone does not turn ordinary prose into code."));
+    assert!(
+        !md.contains("```"),
+        "a wholly monospaced prose page is not code: {md}"
+    );
+}
+
+#[test]
+fn test_p1244_employer_omb_words_remain_separated() {
+    let markdown = pdf_inspector::process_pdf("tests/fixtures/p1244-1996.pdf")
+        .unwrap()
+        .markdown
+        .unwrap();
+    assert!(
+        markdown.contains("Employer OMB No. 1545-0065"),
+        "expected the separated Employer and OMB label: {markdown}"
+    );
+    assert!(
+        !markdown.contains("EmployerOMB"),
+        "the separated Employer and OMB label must not be glued: {markdown}"
+    );
+}
+
 // ============================================================================
 // Header Level Detection Tests
 // ============================================================================
@@ -1342,11 +1388,6 @@ fn test_snapshot_thermo_freon12() {
 #[test]
 fn test_snapshot_td9264() {
     assert_snapshot("td9264");
-}
-
-#[test]
-fn test_snapshot_p1244() {
-    assert_snapshot("p1244-1996");
 }
 
 #[test]

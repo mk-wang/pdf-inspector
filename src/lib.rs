@@ -7960,7 +7960,7 @@ mod rotated_run_region_tests {
         // (most items at negative y); a clockwise frame is never inferred and
         // must be passed explicitly.
         assert_eq!(
-            infer_region_coord_space(&[header.clone()]),
+            infer_region_coord_space(std::slice::from_ref(&header)),
             RegionCoordSpace::Standard
         );
         assert_eq!(
@@ -7972,7 +7972,7 @@ mod rotated_run_region_tests {
             RegionCoordSpace::Standard
         );
         let strip = collect_text_in_region_in_frame(
-            &[header.clone()],
+            std::slice::from_ref(&header),
             570.0,
             80.0,
             600.0,
@@ -7982,7 +7982,7 @@ mod rotated_run_region_tests {
         );
         assert_eq!(strip, "HEADER");
         let misread = collect_text_in_region_in_frame(
-            &[header.clone()],
+            std::slice::from_ref(&header),
             570.0,
             80.0,
             600.0,

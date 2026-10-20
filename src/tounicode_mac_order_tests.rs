@@ -128,12 +128,8 @@ fn arial_like(digit_widths: &[u16], space: (bool, u16)) -> Vec<(bool, u16)> {
     for (i, &w) in digit_widths.iter().enumerate() {
         glyphs[19 + i] = (true, w);
     }
-    for gid in 36..=61 {
-        glyphs[gid] = (true, 667);
-    }
-    for gid in 68..=93 {
-        glyphs[gid] = (true, 556);
-    }
+    glyphs[36..=61].fill((true, 667));
+    glyphs[68..=93].fill((true, 556));
     glyphs[76] = (true, 222); // i
     glyphs[79] = (true, 222); // l
     glyphs[80] = (true, 833); // m
@@ -283,9 +279,7 @@ fn mac_order_needs_letter_proportions_to_agree() {
     let mut wide_i = arial_like(&[556; 10], (false, 278));
     wide_i[76] = (true, 900);
     let mut wide_lower = arial_like(&[556; 10], (false, 278));
-    for gid in 68..=93 {
-        wide_lower[gid] = (true, 700);
-    }
+    wide_lower[68..=93].fill((true, 700));
     wide_lower[76] = (true, 222);
     wide_lower[79] = (true, 222);
     wide_lower[80] = (true, 833);
@@ -301,9 +295,7 @@ fn mac_order_needs_letters_present_to_check() {
     let mut glyphs = vec![(false, 0u16); 98];
     glyphs[0] = (true, 750);
     glyphs[3] = (false, 278);
-    for gid in 19..=28 {
-        glyphs[gid] = (true, 556);
-    }
+    glyphs[19..=28].fill((true, 556));
     assert!(build_cmap_from_mac_glyph_order(&cmapless_truetype(&glyphs)).is_none());
 }
 
@@ -338,9 +330,7 @@ fn mac_order_declines_a_unicode_keyed_font() {
     let mut glyphs = vec![(false, 0u16); 0x7B];
     glyphs[0] = (true, 750);
     glyphs[0x20] = (false, 278);
-    for code in 0x30..=0x39 {
-        glyphs[code] = (true, 556);
-    }
+    glyphs[0x30..=0x39].fill((true, 556));
     for code in (0x41..=0x5A).chain(0x61..=0x7A) {
         glyphs[code] = (true, 600);
     }
