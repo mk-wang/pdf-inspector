@@ -2938,6 +2938,38 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
+    // Reject grids with an empty interior column. Text-start clustering can
+    // place an edge at the first line of a cell while its wrapped lines start
+    // further right; no item center ever lands in the band between them, so
+    // the spurious column is completely empty while the grid still looks
+    // well-distributed. `try_build_grid` rejects the same shape. Outer empty
+    // columns stay allowed (decorative rail rects) — only the bands between
+    // real content columns are structural evidence.
+    let first_col = (0..num_cols).find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    let last_col = (0..num_cols).rev().find(|&col| {
+        cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()))
+    });
+    if let (Some(first_col), Some(last_col)) = (first_col, last_col) {
+        for col in first_col + 1..last_col {
+            let col_has_content = cells
+                .iter()
+                .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
+            if !col_has_content {
+                debug!(
+                    "  cell-rect rejected: interior column {} is completely empty",
+                    col
+                );
+                return None;
+            }
+        }
+    }
+
     let mut row_edges = row_edges;
     let (collapsed_cells, collapsed_row_edges, collapsed_rows) =
         collapse_multiline_description_rows(cells, row_edges, &col_edges);
@@ -5579,6 +5611,148 @@ mod tests {
         assert_eq!(data1[1].trim(), "7701023403016");
         assert!(data1[2].trim().contains("Arnes"));
         assert_eq!(data1[3].trim(), "1");
+    }
+
+    /// Text-start column clustering can put an edge between a cell's first
+    /// line (x≈210) and its wrapped continuation (x≈246) while no item center
+    /// ever lands in the band between the label column and the description
+    /// (x≈145..220). At the same time a decorative band high on the page pulls
+    /// the table's top row over the section heading. The result was a 4-column
+    /// table with an empty interior column whose first row swallowed
+    /// "6. ECO CIRCLE COMPETENCE FRAMEWORK". Rejecting the empty interior
+    /// column drops the whole hypothesis so the heading and body flow as text.
+    #[test]
+    fn cell_rect_empty_interior_column_is_rejected() {
+        let page = 1;
+        // Five visual rows: label cell + wide description cell, plus row
+        // separators and a decorative band that shares the rect cluster.
+        let rows = [
+            (618.70_f32, 33.00_f32),
+            (531.67, 77.06),
+            (406.75, 80.04),
+            (329.93, 64.80),
+            (244.49, 73.44),
+        ];
+        let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for &(y, h) in &rows {
+            rects.push((71.54, y, 133.10, h));
+            rects.push((205.13, y, 315.29, h));
+        }
+        for &(y, h) in &[
+            (614.74_f32, 3.96_f32),
+            (525.67, 6.0),
+            (492.79, 6.0),
+            (400.73, 6.02),
+            (323.93, 6.0),
+        ] {
+            rects.push((71.06, y, 134.06, h));
+        }
+        rects.push((399.0, 782.62, 162.15, 41.25));
+        rects.push((508.90, 618.70, 11.52, 33.00));
+
+        let item = |text: &str, x: f32, y: f32, width: f32| {
+            let mut it = make_item(text, x, y, 9.0);
+            it.width = width;
+            it
+        };
+        let items = vec![
+            item("6. ECO CIRCLE COMPETENCE FRAMEWORK", 85.10, 693.50, 326.23),
+            item("Competence Area", 76.10, 640.0, 73.30),
+            item("Competence Statement", 76.10, 595.0, 62.70),
+            item("Learning Outcomes", 76.10, 560.0, 96.30),
+            item("Knowledge", 76.10, 470.0, 55.0),
+            item("Skills", 76.10, 410.0, 25.20),
+            item("Attitudes and Values", 76.10, 270.0, 103.80),
+            item("#1 THE 3 Rs: RECYCLE-REUSE-REDUCE", 213.17, 640.0, 227.50),
+            item("To know the basics of the 3 Rs", 210.05, 595.0, 100.0),
+            item("implementation into daily life", 246.05, 560.0, 100.0),
+            item("To understand the meaning", 210.05, 470.0, 100.0),
+            item("and how they connect", 246.05, 455.0, 100.0),
+            item("To implement different ways", 210.05, 410.0, 100.0),
+            item("of waste management", 246.05, 395.0, 100.0),
+            item("To acquire a proactive approach", 210.05, 270.0, 100.0),
+            item("●", 228.05, 470.0, 6.0),
+            item("●", 228.05, 410.0, 6.0),
+            item("●", 228.05, 270.0, 6.0),
+        ];
+
+        if let Some(table) = detect_row_stripe_table_from_cell_rects(&items, &rects, page) {
+            panic!(
+                "grid with an empty interior column must be rejected; got {}x{} cells {:?}",
+                table.rows.len(),
+                table.columns.len(),
+                table.cells
+            );
+        }
+
+        // `None` returns no `item_indices`, so neither the heading nor the
+        // body text is claimed: both survive as ordinary text instead of the
+        // heading landing in a table cell.
+    }
+
+    /// A table with a sparse label column (merged label cells leave rows where
+    /// column 0 is empty) plus marker and description columns is a real data
+    /// table: each column holds content somewhere. The interior-column guard
+    /// must not reject it, and the description data must be retained.
+    #[test]
+    fn cell_rect_sparse_label_column_keeps_description_data() {
+        let page = 1;
+        let col_xs = [50.0_f32, 130.0, 200.0, 460.0];
+        let row_ys: Vec<f32> = (0..=5).map(|r| 400.0 - 20.0 * r as f32).collect();
+        let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for r in 0..5 {
+            for c in 0..3 {
+                rects.push((
+                    col_xs[c],
+                    row_ys[r + 1],
+                    col_xs[c + 1] - col_xs[c],
+                    row_ys[r] - row_ys[r + 1],
+                ));
+            }
+        }
+
+        let item = |text: &str, x: f32, y: f32, width: f32| {
+            let mut it = make_item(text, x, y, 9.0);
+            it.width = width;
+            it
+        };
+        let descriptions = [
+            "To implement different ways",
+            "To properly implement recycling",
+            "To promote reducing and reusing",
+            "To acquire a proactive approach",
+            "To educate others on waste",
+        ];
+        let mut items = vec![
+            item("Skills", 55.0, 385.0, 40.0),
+            item("Attitudes and Values", 55.0, 305.0, 40.0),
+        ];
+        for (r, text) in descriptions.iter().enumerate() {
+            let y = 385.0 - 20.0 * r as f32;
+            items.push(item("●", 150.0, y, 10.0));
+            items.push(item(text, 210.0, y, 200.0));
+        }
+
+        let table = detect_row_stripe_table_from_cell_rects(&items, &rects, page)
+            .expect("sparse label column is not an empty column; table must detect");
+        assert_eq!(table.rows.len(), 5);
+        assert_eq!(table.columns.len(), 3);
+        assert_eq!(table.cells[0][0], "Skills");
+        assert_eq!(table.cells[0][1], "●");
+        assert_eq!(table.cells[0][2], "To implement different ways");
+        assert!(
+            table.cells[1][0].is_empty(),
+            "sparse label row must stay empty, not borrow neighbouring labels: {:?}",
+            table.cells
+        );
+        assert_eq!(table.cells[4][0], "Attitudes and Values");
+        for text in descriptions {
+            assert!(
+                table.cells.iter().any(|row| row[2].contains(text)),
+                "{text:?} must be retained in the description column: {:?}",
+                table.cells
+            );
+        }
     }
 
     #[test]

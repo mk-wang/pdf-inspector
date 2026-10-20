@@ -17,9 +17,13 @@ version and date. Earlier releases are described in their
   accepted by existing SDK build configurations.
 - Preserve configured decompression limits in upstream font, CMap, and
   executed-content analysis paths.
+- Run paired benchmarks against the supplied CLI binaries without an external
+  parser adapter. Optional artifacts retain predictions, evaluations, and input hashes.
 
 ### Fixed
 
+- Reject cell-rectangle table candidates with empty interior columns, so
+  spurious grids do not absorb standalone headings into table cells.
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
   comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
   read through the Windows variant of the standard glyph order. That
