@@ -188,10 +188,7 @@ fn wholly_monospace_pages(lines: &[TextLine]) -> HashSet<u32> {
 }
 
 /// Whether a text line opens a code block from its font alone.
-fn line_opens_code_block(
-    line: &TextLine,
-    wholly_monospace: &HashSet<u32>,
-) -> bool {
+fn line_opens_code_block(line: &TextLine, wholly_monospace: &HashSet<u32>) -> bool {
     if !super::classify::line_is_monospace(line) {
         return false;
     }

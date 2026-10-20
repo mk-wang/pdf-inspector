@@ -9,6 +9,32 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Changed
+
+- Pin the native and WebAssembly `lopdf` dependency to fork commit
+  `95cf12efa22bbfd6875f7eb028fcb0bdbf23e809`.
+
+## [1.20.0] - 2026-09-14
+
+Changes since 1.19.0.
+
+### Added
+
+- An optional display frame for the positioned-text and region APIs. Rust
+  `extract_text_with_positions_mem_in_frame`,
+  `extract_text_with_positions_and_rotations_mem_in_frame`,
+  `extract_text_in_regions_mem_in_frame` and
+  `extract_tables_in_regions_mem_in_frame` take a `PositionFrame`; Node
+  `extractTextWithPositions`, `extractTextWithPositionsAndRotations`,
+  `extractTextInRegions` and `extractTablesInRegions` take an optional
+  `{ frame: "sheet" | "display" }`. `"display"` reports items in, and reads
+  region rects from, the rendered page — the visible page box turned clockwise
+  by the page's inheritable `/Rotate`, with the turn of a predominantly rotated
+  page undone — so boxes line up with a rendered page image. `"sheet"`, the
+  default, is unchanged. `extractTextWithPositionsAndRotations` also accepts
+  the same 1-indexed `pages` filter as `extractTextWithPositions`.
+  ([#533](https://github.com/firecrawl/pdf-inspector/pull/533))
+
 ### Fixed
 
 - A line band no longer reaches two baselines of one column. Bands were bounded
@@ -19,11 +45,41 @@ version and date. Earlier releases are described in their
   and the wrapped line above it came out as "1.381must the detained ..."). A
   band now bounds its whole y span, and a super/subscript run still straddles
   it on the attachment geometry script detection already looks for.
+- Preserve word spaces painted as separate whitespace runs squeezed by
+  negative character spacing, so adjacent words no longer merge.
+  ([#517](https://github.com/firecrawl/pdf-inspector/pull/517))
+- Read blank, advancing glyphs in symbolic TrueType fonts as word spaces
+  while preserving invisible text layers and formatting characters.
+  ([#521](https://github.com/firecrawl/pdf-inspector/pull/521))
+- Recover text from cmap-less TrueType subsets using standard Macintosh
+  glyph ordering when the embedded font's metrics corroborate the mapping.
+  ([#522](https://github.com/firecrawl/pdf-inspector/pull/522))
+- Decode painted glyphs when `ActualText` contains replacement characters,
+  and keep spaced or separately painted dot leaders with their text line.
+  ([#523](https://github.com/firecrawl/pdf-inspector/pull/523))
+- Start `TJ` sub-runs at their first painted glyph after leading positioning
+  offsets, correcting their bounds and the order of split words.
+  ([#527](https://github.com/firecrawl/pdf-inspector/pull/527))
+- Word spaces carried by character spacing instead of space glyphs — the two
+  glyphs around a word boundary shown as one string with a `Tc` as wide as a
+  word space, the spacing taken back with a positive `TJ` offset or by
+  positioning the next run — no longer glue their words together
+  ("sendtoMars"). Such a string reads with its spaces once the spacing after
+  it is seen to be taken back; tracked display text, whose spacing never is,
+  keeps its letters together.
+  ([#530](https://github.com/firecrawl/pdf-inspector/pull/530))
 - A contents page whose entries end in right-aligned page numbers without dot
   leaders — an edited volume's table of contents with the chapter authors on
   their own lines — is rendered as a contents list, one entry per line with
   its page number tab-separated, instead of being read as a two-column page
   whose titles and numbers interleave into a paragraph.
+  ([#493](https://github.com/firecrawl/pdf-inspector/pull/493))
+
+### Changed
+
+- Upgrade `lopdf` to 0.45.0 for improved recovery of malformed cross-reference
+  entries and `startxref` / `/Prev` offsets.
+  ([#534](https://github.com/firecrawl/pdf-inspector/pull/534))
 
 ## [1.19.0] - 2026-09-09
 

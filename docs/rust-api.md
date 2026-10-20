@@ -533,15 +533,29 @@ ignored, and a page without a MediaBox is measured against US Letter).
 `TextItem.x`/`y` use the box's lower-left corner as origin with `y` growing
 upward; region and crop bboxes (`extract_text_in_regions_mem`,
 `extract_tables_in_regions_mem`, `detect_vector_grid_in_region_mem`,
-`TsrTableInput`) use its top-left corner with `y` growing downward, exactly
-like a rendered page image. Converting between the two only needs the box
-height `h`: a positioned `y` becomes `h - y`. For text items `y` is the
+`TsrTableInput`) use its top-left corner with `y` growing downward, the axis
+convention of a rendered page image. Converting between the two only needs
+the box height `h`: a positioned `y` becomes `h - y`. For text items `y` is the
 baseline and `height` the font size, so `[x, h - y - height, x + width, h - y]`
 covers the glyph band above the baseline (descenders fall below it); for image,
 link and form-field items `y` is the rect bottom and that box is exact. Pages
 whose CropBox equals the MediaBox with a `(0, 0)` origin are unaffected by this
 convention. Pages whose text is drawn rotated by 90° are normalized into a
 synthetic landscape frame before the shift, and `/Rotate` is not applied.
+
+That is the **sheet** frame (`PositionFrame::Sheet`), the default of every
+position and region API. Its coordinates coincide with a rendered page image
+only for pages with `/Rotate 0` whose text is not predominantly rotated; for
+any other page, boxes taken from a rendered image belong in the **display**
+frame (`PositionFrame::Display`) that the `_in_frame` variants offer: the
+rendered page, i.e. the visible page box turned clockwise by the page's
+inheritable `/Rotate`, with the same origin conventions — items from the
+lower-left corner with `y` up, regions from the top-left corner with `y` down
+— and with the synthetic turn of a predominantly rotated page undone first
+(individual runs keep their own `rotation`). Items then sit where a renderer
+draws them, `rotation` reads `0` for text that renders horizontally, and
+region rects can be taken straight from a rendered page image. `/Rotate` is
+read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 
 ## Processing modes
 
@@ -564,7 +578,13 @@ synthetic landscape frame before the shift, and `/Rotate` is not applied.
 | `prepare_hybrid_markdown(document, options)` | Prepare one OCR-completable global Markdown session from a loaded `lopdf::Document` |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with its axis-aligned box (visible-page-box frame, see above), `rotation`, and font info |
+| `extract_text_with_positions_mem_in_frame(bytes, pages, frame)` | Positioned text from bytes, limited to 1-indexed `pages`, in the sheet or display frame (`PositionFrame`) |
 | `extract_text_with_positions_and_rotations_mem(bytes)` | Positioned text plus the `PageRotation` of every page whose text was predominantly rotated |
+| `extract_text_with_positions_and_rotations_mem_in_frame(bytes, pages, frame)` | The same with a page filter and a frame choice |
+| `extract_text_in_regions_mem(bytes, page_regions)` | Text inside top-left region rects (sheet frame) |
+| `extract_text_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
+| `extract_tables_in_regions_mem(bytes, page_regions)` | Markdown tables inside region rects (sheet frame) |
+| `extract_tables_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
 | `collect_text_in_region_in_frame(items, x1, y1, x2, y2, page_height, rotation)` | Region text with the page's coordinate frame given explicitly (`page_height` is the visible page box height) |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
@@ -590,6 +610,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info, page number, and optional structure-tree `mcid` |
 | `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
+| `PositionFrame` | `Sheet` (default): the visible page box as laid out in the content stream, `/Rotate` not applied, predominantly rotated pages turned; `Display`: the rendered page, the visible box turned clockwise by the inheritable `/Rotate`, with only the synthetic turn of a predominantly rotated page undone first while individual runs keep their own `rotation` (see [Coordinate frame](#coordinate-frame)) |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |

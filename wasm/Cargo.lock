@@ -594,7 +594,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "lopdf"
 version = "0.45.0"
-source = "git+https://github.com/mk-wang/lopdf.git?rev=e32e841b08c54982c9e3f1a3cd38cf6aceeea4bc#e32e841b08c54982c9e3f1a3cd38cf6aceeea4bc"
+source = "git+https://github.com/mk-wang/lopdf.git?rev=95cf12efa22bbfd6875f7eb028fcb0bdbf23e809#95cf12efa22bbfd6875f7eb028fcb0bdbf23e809"
 dependencies = [
  "aes",
  "bitflags 2.13.2",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector"
-version = "1.19.0"
+version = "1.20.0"
 dependencies = [
  "env_logger",
  "include_dir",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector-wasm"
-version = "1.19.0"
+version = "1.20.0"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

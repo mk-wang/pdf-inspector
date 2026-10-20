@@ -1884,7 +1884,9 @@ pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
         // Single TOC with empty/leader middle columns (col 0 = title, col 3 = page).
         let is_empty_or_dots = |s: &str| {
             let t = s.trim();
-            t.is_empty() || t.chars().all(|c| c == '.' || c == '\u{2026}' || c.is_whitespace())
+            t.is_empty()
+                || t.chars()
+                    .all(|c| c == '.' || c == '\u{2026}' || c.is_whitespace())
         };
         let middle_sparse = cells
             .iter()
@@ -3754,7 +3756,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn has_table_like_content_rejects_wide_single_word_prose() {
         // Multi-column prose text where words happen to form a 5-column grid.
@@ -3762,17 +3763,83 @@ mod tests {
         // Must be rejected by has_table_like_content instead of bypassing
         // on column count alone.
         let cells = vec![
-            vec!["THE".into(), String::new(), "taste".into(), "of".into(), "the".into()],
-            vec!["world".into(), "which".into(), "has".into(), "veered".into(), "so".into()],
-            vec!["often".into(), "is".into(), "constant".into(), "enough".into(), "to".into()],
-            vec!["fairy".into(), "tales".into(), "The".into(), "children".into(), "to".into()],
-            vec!["whom".into(), "and".into(), "for".into(), "whom".into(), "they".into()],
-            vec!["are".into(), "told".into(), "represent".into(), "the".into(), "young".into()],
-            vec!["age".into(), "of".into(), "man".into(), "They".into(), "are".into()],
-            vec!["true".into(), "to".into(), "his".into(), "early".into(), "loves".into()],
-            vec!["they".into(), "have".into(), "his".into(), "unblunted".into(), "edge".into()],
-            vec!["of".into(), "belief".into(), "and".into(), "fresh".into(), "appetite".into()],
-            vec!["for".into(), "marvels".into(), "The".into(), "instinct".into(), "of".into()],
+            vec![
+                "THE".into(),
+                String::new(),
+                "taste".into(),
+                "of".into(),
+                "the".into(),
+            ],
+            vec![
+                "world".into(),
+                "which".into(),
+                "has".into(),
+                "veered".into(),
+                "so".into(),
+            ],
+            vec![
+                "often".into(),
+                "is".into(),
+                "constant".into(),
+                "enough".into(),
+                "to".into(),
+            ],
+            vec![
+                "fairy".into(),
+                "tales".into(),
+                "The".into(),
+                "children".into(),
+                "to".into(),
+            ],
+            vec![
+                "whom".into(),
+                "and".into(),
+                "for".into(),
+                "whom".into(),
+                "they".into(),
+            ],
+            vec![
+                "are".into(),
+                "told".into(),
+                "represent".into(),
+                "the".into(),
+                "young".into(),
+            ],
+            vec![
+                "age".into(),
+                "of".into(),
+                "man".into(),
+                "They".into(),
+                "are".into(),
+            ],
+            vec![
+                "true".into(),
+                "to".into(),
+                "his".into(),
+                "early".into(),
+                "loves".into(),
+            ],
+            vec![
+                "they".into(),
+                "have".into(),
+                "his".into(),
+                "unblunted".into(),
+                "edge".into(),
+            ],
+            vec![
+                "of".into(),
+                "belief".into(),
+                "and".into(),
+                "fresh".into(),
+                "appetite".into(),
+            ],
+            vec![
+                "for".into(),
+                "marvels".into(),
+                "The".into(),
+                "instinct".into(),
+                "of".into(),
+            ],
         ];
         assert!(
             !has_table_like_content(&cells, TableDetectionMode::BodyFont),

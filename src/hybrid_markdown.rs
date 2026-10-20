@@ -638,7 +638,8 @@ fn prepare_markdown_state(
             .filter(|page| selected(*page))
             .collect();
         for item in &source_items {
-            if !matches!(item.item_type, crate::types::ItemType::Image) && !item.text.trim().is_empty()
+            if !matches!(item.item_type, crate::types::ItemType::Image)
+                && !item.text.trim().is_empty()
             {
                 only_raster.remove(&item.page);
             }
@@ -814,11 +815,7 @@ impl PreparedMarkdown {
                         HybridMarkdownPageSource::Ocr
                     }
                 } else if self.source_items.iter().any(|item| {
-                    item.page == page
-                        && !matches!(
-                            item.item_type,
-                            crate::types::ItemType::Image
-                        )
+                    item.page == page && !matches!(item.item_type, crate::types::ItemType::Image)
                 }) {
                     HybridMarkdownPageSource::NativeText
                 } else {
