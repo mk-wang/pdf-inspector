@@ -64,7 +64,7 @@ pub fn table_to_markdown(table: &Table) -> String {
 ///
 /// Supplemental OCR uses this at the structured-table boundary so incomplete
 /// detections cannot modify an otherwise clean native page.
-#[cfg(any(test, feature = "ocr"))]
+#[cfg(any(test, feature = "vision"))]
 pub(crate) fn is_complete_data_table(table: &Table) -> bool {
     if table.kind != TableKind::Data {
         return false;

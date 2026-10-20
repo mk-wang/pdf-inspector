@@ -92,6 +92,9 @@ console.log(result.confidence)     // 0.875
 
 ### `extractTextWithPositions(buffer: Buffer, pages?: number[], options?: FrameOptions): TextItem[]`
 
+An async variant, `extractTextWithPositionsAsync`, takes the same arguments and
+resolves to the same items (see [Async variants](#async-variants)).
+
 Every text item (plus image placeholders, links and form fields) with its font
 and position. `x`/`y` are PDF points relative to the page's **visible page
 box** (`CropBox ∩ MediaBox`, else the MediaBox), origin at the box's lower-left
@@ -114,6 +117,51 @@ page undone — so `x`/`y`/`width`/`height` and `rotation` describe the item as
 a renderer draws it. Pages with `/Rotate 0` whose text is not predominantly
 rotated are identical in both frames.
 
+`fontWeight` is the font's weight class on the 100..900 scale shared by CSS
+`font-weight` and the OS/2 `usWeightClass` field (400 regular, 700 bold), read
+from the embedded font program's OS/2 table, else the FontDescriptor's
+`/FontWeight`, else a weight word in the font name ("Light", "Medium", "-Md",
+"Black", "W6"); it is omitted when none of them says. `isBold` is unchanged
+and independent of it, so a medium face reports `fontWeight: 500` with
+`isBold: false`. Pass `{ boldFromWeight: true }` to also read `isBold` from a
+weight class of 600 (SemiBold) or more — or of `boldWeightThreshold`, any
+class on the 100..900 scale — and to merge adjacent runs by that verdict, so a
+heavier run inside a lighter paragraph keeps its own item while runs whose
+weights differ but agree on bold merge as usual.
+
+`boldSource` says where `isBold` came from — `"FontName"` (a bold word or
+style abbreviation in the font name), `"FontFlags"` (the FontDescriptor's
+ForceBold flag or the embedded program's bold selection), `"WeightClass"`
+(the weight class, with `boldFromWeight`) or `"Painted"` (text filled and
+stroked to look heavier), the first of them in that order when more than one
+says bold — so a face whose name says Bold over a `fontWeight` of 400 can be
+told from one whose weight class says so. It is omitted when `isBold` is
+`false`.
+
+`fixedPitch` is `true` when the FontDescriptor's FixedPitch flag or the
+embedded program's `post` table says the font is monospaced, else measured
+from the font's width table: `true` when a dozen or more of its glyphs share
+one advance, `false` when two differ. It is omitted when the font declares
+nothing and no two advances differ but fewer than a dozen share one. Many
+producers write `/Flags 4`
+whatever the face, so the flag is only ever read as a yes.
+
+`fillColor` and `strokeColor` are the colours a run was shown with, as sRGB
+`[red, green, blue]` arrays of 0..255: its glyphs are filled with the first in
+render modes 0, 2, 4 and 6 and outlined with the second in modes 1, 2, 5 and
+6. DeviceRGB is read as sRGB, DeviceGray as three equal components and
+DeviceCMYK converted the way the PDF specification converts it to DeviceRGB;
+ICCBased spaces are read by their component count and Indexed spaces through
+their palette. A colour is omitted for any other colour space (Separation,
+DeviceN, Pattern, CalRGB, Lab, ...). `renderMode` is the text render mode
+(`Tr`) the run was shown with, 0..7: runs in mode 3 (invisible, the mode of OCR
+text layers) and mode 7 (clipping only) put no glyphs on the page, so a caller
+can tell visible text from invisible text. The colours and the mode are
+graphics state — they hold across text objects, `q`/`Q` save and restore them,
+and a Form XObject starts with the paint it was invoked under — and reporting
+them changes nothing about which runs are extracted. All three are omitted for
+image, link and form-field items, and a merged item keeps its first run's.
+
 `legacySymbolRewrite: true` marks items whose decoded text includes a character
 changed by legacy symbol cleanup. Merged items retain this evidence from either
 source, and split items conservatively inherit it. The field is omitted when
@@ -130,6 +178,12 @@ for (const item of extractTextWithPositions(pdf, [1])) { // pages are 1-indexed
 
 // Boxes as a renderer draws the page (`/Rotate` applied)
 const rendered = extractTextWithPositions(pdf, undefined, { frame: 'display' })
+
+// Bold also from the weight class, SemiBold (600) and heavier
+const weighted = extractTextWithPositions(pdf, undefined, { boldFromWeight: true })
+
+// ... or from Bold (700) and heavier
+const heavier = extractTextWithPositions(pdf, undefined, { boldFromWeight: true, boldWeightThreshold: 700 })
 ```
 
 ### `extractTextWithPositionsAndRotations(buffer: Buffer, pages?: number[], options?: FrameOptions): PositionedText`
@@ -157,7 +211,8 @@ rendered page (the visible box turned clockwise by the page's inheritable
 `/Rotate`; the page-level turn of a predominantly rotated page is undone
 first, while individual runs keep their own `rotation`), as a layout model
 working on page images reports them, whatever the page's `/Rotate` or text
-direction. `extractTablesInRegions` takes the same option.
+direction. `extractTablesInRegions` takes the same options, `boldFromWeight`
+included (see `extractTextWithPositions`).
 
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues). When the cause is a suspected garbled text layer, `ocrReason` is set to `"suspected_garbled_text"`.
 
@@ -192,18 +247,20 @@ for (const region of result[0].regions) {
 
 ### Async variants
 
-`processPdf`, `classifyPdf`, and `extractPagesMarkdown` are synchronous and parse on the calling thread — in Node, that's the event loop. For a one-off call in a script that's fine, but in a server a large document can hold the loop for tens to hundreds of milliseconds.
+`processPdf`, `classifyPdf`, `extractPagesMarkdown`, and `extractTextWithPositions` are synchronous and parse on the calling thread — in Node, that's the event loop. For a one-off call in a script that's fine, but in a server a large document can hold the loop for tens to hundreds of milliseconds, and an unusual one for much longer.
 
-`processPdfAsync`, `classifyPdfAsync`, and `extractPagesMarkdownAsync` take the same arguments and produce the same results, but run the parse on the libuv thread pool and return a promise, keeping the event loop free. The input buffer is copied before the call returns, so it's safe to reuse or mutate immediately:
+`processPdfAsync`, `classifyPdfAsync`, `extractPagesMarkdownAsync`, and `extractTextWithPositionsAsync` take the same arguments and produce the same results, but run the parse on the libuv thread pool and return a promise, keeping the event loop free. Invalid options still throw when the call is made. The input buffer is copied before the call returns, so it's safe to reuse or mutate immediately:
 
 ```typescript
-import { classifyPdfAsync, extractPagesMarkdownAsync } from '@firecrawl/pdf-inspector'
+import { classifyPdfAsync, extractPagesMarkdownAsync, extractTextWithPositionsAsync } from '@firecrawl/pdf-inspector'
 
 const classification = await classifyPdfAsync(pdf)
 if (classification.pdfType === 'TextBased') {
   const { pages } = await extractPagesMarkdownAsync(pdf)
   // ...
 }
+
+const items = await extractTextWithPositionsAsync(pdf, [1, 2], { frame: 'display' })
 ```
 
 ## Types
@@ -216,6 +273,24 @@ interface PdfClassification {
   confidence: number        // 0.0 - 1.0
 }
 
+interface PdfResult {       // processPdf / detectPdf (excerpt)
+  pdfType: string
+  markdown?: string         // omitted by detectPdf
+  pageCount: number
+  // The document information dictionary's entries, decoded as PDF text
+  // strings (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+  // otherwise); each omitted when missing or not a string.
+  title?: string
+  author?: string
+  subject?: string
+  keywords?: string
+  creator?: string          // the application the document was authored in
+  producer?: string         // the application that wrote the PDF
+  creationDate?: string     // as written, e.g. "D:20240115103000+01'00'"
+  modDate?: string
+  // ...
+}
+
 interface PageRegions {
   page: number              // 0-indexed
   regions: number[][]       // [[x1, y1, x2, y2], ...] in PDF points, top-left origin of the visible page box
@@ -224,6 +299,8 @@ interface PageRegions {
 
 interface FrameOptions {
   frame?: "sheet" | "display" // coordinate frame of items and region bboxes; "sheet" by default
+  boldFromWeight?: boolean    // also read isBold from fontWeight >= boldWeightThreshold and merge runs by that verdict; false by default
+  boldWeightThreshold?: number // the weight class boldFromWeight reads bold from, 100..900; 600 by default
 }
 
 interface PositionedText {

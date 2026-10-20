@@ -12,19 +12,154 @@ use crate::text_utils::should_join_items;
 /// and whether fonts with unresolvable gid-encoded glyphs were encountered.
 pub(crate) type PageExtraction = (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>);
 
+/// Per font (its `/BaseFont` name, or its resource name without one), how
+/// the codes shown through the font's CMap fared: the codes shown, the ones
+/// read from the mapped codes around them and the ones left unmapped.
+/// Ordered by name so documents report their fonts the same way.
+pub(crate) type CMapCoverageByFont =
+    std::collections::BTreeMap<String, crate::tounicode::CidDecodeStats>;
+
+/// The CMap coverage of one run of text of one font, with the geometry of
+/// the item a content stream walker attached it to — the item the run
+/// made, or the page's next item for a run that made none — once the
+/// page's frame was settled, so a run the page box leaves out takes its
+/// codes with it.
+/// The name a font's coverage is counted under — its `/BaseFont` name, or
+/// its resource name without one — shared by every run of the font on the
+/// page rather than copied for each.
+pub(crate) type FontLabel = std::rc::Rc<str>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RunCoverage {
+    /// The run's `(x, y, width)` in the items' frame; `None` for the
+    /// coverage of show operators that no item followed on the page (a
+    /// trailing run of blank codes, of codes that read as nothing), which
+    /// has no place to be judged by and is counted wherever it lies.
+    pub(crate) position: Option<(f32, f32, f32)>,
+    /// The font's `/BaseFont` name, or its resource name without one.
+    pub(crate) font: FontLabel,
+    pub(crate) stats: crate::tounicode::CidDecodeStats,
+}
+
+/// The coverage waiting to be attached to an item: the decodes of the
+/// show operators since the last attachment, summed per font in the order
+/// the fonts were used, so a blank run of one font waiting beside the next
+/// run of another keeps its own name.
+pub(crate) type PendingCoverage = Vec<(FontLabel, crate::tounicode::CidDecodeStats)>;
+
+/// Per item of a content stream walker, parallel to its items like their
+/// clips: the coverage of the decodes that produced the item. The coverage
+/// waiting when a show operator appends items goes to the first of them,
+/// nothing to the rest (one TJ array can split into several).
+pub(crate) type ItemCoverage = Vec<PendingCoverage>;
+
+/// Attach the coverage the show operators since the last attachment
+/// recorded — `take` hands it over and leaves none behind — to the first of
+/// the items they appended, bringing `item_coverage` up to `items_len`
+/// entries. An operator that appended no item — a run of blank codes, of
+/// codes that read as nothing — leaves its coverage waiting for the next
+/// item appended on the page, so that its codes count where that item is;
+/// the page walker keeps what is still waiting at the end of the page as a
+/// run without a position.
+pub(crate) fn attach_run_coverage(
+    item_coverage: &mut ItemCoverage,
+    items_len: usize,
+    take: impl FnOnce() -> PendingCoverage,
+) {
+    if items_len > item_coverage.len() {
+        item_coverage.push(take());
+        item_coverage.resize(items_len, Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod run_coverage_tests {
+    use super::{attach_run_coverage, FontLabel, ItemCoverage, PendingCoverage};
+    use crate::tounicode::CidDecodeStats;
+
+    #[test]
+    fn coverage_of_an_operator_without_an_item_waits_for_the_next_item() {
+        let stats = |codes: u32| CidDecodeStats {
+            codes,
+            interpolated: 0,
+            unmapped: 0,
+        };
+        let label: FontLabel = FontLabel::from("F");
+        let mut pending: PendingCoverage = vec![(label.clone(), stats(1))];
+        let mut coverage = ItemCoverage::new();
+        // No item appended: the coverage is not taken.
+        attach_run_coverage(&mut coverage, 0, || std::mem::take(&mut pending));
+        assert!(coverage.is_empty());
+        assert_eq!(pending.len(), 1);
+        // Two items appended by the next operator: the first gets it.
+        attach_run_coverage(&mut coverage, 2, || std::mem::take(&mut pending));
+        assert_eq!(coverage, vec![vec![(label, stats(1))], vec![]]);
+        assert!(pending.is_empty());
+    }
+}
+
 // ── Font types (crate-internal) ──────────────────────────────────────
 
 /// Font encoding map: maps byte codes to Unicode characters
 pub(crate) type FontEncodingMap = HashMap<u8, char>;
 
+/// A single-byte encoding a simple font's codes read through where its
+/// `/Differences` say nothing: one of the predefined encodings named by an
+/// encoding dictionary's `/BaseEncoding`, or the built-in encoding of the
+/// standard Symbol and ZapfDingbats fonts, whose glyphs sit at positions
+/// that have nothing to do with the Latin encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaseEncoding {
+    Standard,
+    WinAnsi,
+    MacRoman,
+    MacExpert,
+    Symbol,
+    ZapfDingbats,
+}
+
 /// Explicit glyph encodings and narrowly verified repairs for a stale CMap.
 pub(crate) struct FontEncoding {
+    /// The character of each code the font's `/Differences` name by a name
+    /// that reads as one (through the embedded program for a numbered
+    /// name), and, beneath them, of each code the built-in encoding of an
+    /// embedded Type 1 program names, for a font whose `/Encoding` names no
+    /// base (see `fonts::type1_builtin_encoding`); a longer reading is in
+    /// `sequences`.
     pub(crate) differences: FontEncodingMap,
-    pub(crate) identity_overrides: FontEncodingMap,
+    /// Codes whose entry in a stale ToUnicode CMap describes the slot's
+    /// original occupant rather than the glyph the font's `/Differences`
+    /// put there, and what that glyph reads as by its name: a character,
+    /// the letters of a ligature, or nothing (an empty string) for a glyph
+    /// whose name spells no character (see
+    /// `fonts::stale_identity_cmap_overrides_with_limit`).
+    pub(crate) identity_overrides: HashMap<u8, String>,
     /// Codes whose embedded glyph has no outline but a positive advance:
     /// painted, they leave a gap and nothing else, so they read as spaces
-    /// whatever the font's ToUnicode claims (see `blank_glyph_codes`).
+    /// whatever the font's ToUnicode claims (see `blank_glyph_codes_with_limit`).
     pub(crate) blank_codes: std::collections::HashSet<u8>,
+    /// The encoding the codes read through where `differences` say nothing
+    /// (see [`BaseEncoding`]); `None` leaves them to the standard decode.
+    pub(crate) base: Option<BaseEncoding>,
+    /// The predefined encoding the font declares by name (`/Encoding
+    /// /WinAnsiEncoding`, written in place or as an indirect name object),
+    /// which names the glyph of each code — read for a code whose ToUnicode
+    /// entry is a control destination, where the standard decode reads the
+    /// rest as before.
+    pub(crate) named: Option<BaseEncoding>,
+    /// Every code the `/Differences` array names, mapped or not, and each
+    /// code other than the word space that the encoding array of an
+    /// embedded Type 1 program leaves at `.notdef`, for a font whose
+    /// `/Encoding` names no base (see `fonts::type1_builtin_encoding`): a
+    /// code named there is that glyph, whatever the base encoding puts at
+    /// it, and one that `differences` and `sequences` do not read reads as
+    /// nothing.
+    pub(crate) named_codes: std::collections::HashSet<u8>,
+    /// Codes whose glyph stands for several characters, named by the
+    /// `/Differences` or, beneath them, by the encoding array of an
+    /// embedded Type 1 program: a ligature named by its components (`f_t`,
+    /// `f_f_i`) or by a `uni` sequence, read as the letters it joins.
+    pub(crate) sequences: HashMap<u8, String>,
 }
 
 /// All font encodings for a page
@@ -50,8 +185,54 @@ pub(crate) struct FontWidthInfo {
     pub(crate) wmode: u8,
 }
 
+/// Glyphs a width table has to carry, all sharing one advance, before it
+/// counts as fixed-pitch on the evidence of its advances alone: a
+/// proportional face's ten tabular digits share theirs too.
+pub(crate) const FIXED_PITCH_MIN_GLYPHS: usize = 12;
+
+impl FontWidthInfo {
+    /// Whether the glyphs in the width table share one advance: `Some(true)`
+    /// when at least [`FIXED_PITCH_MIN_GLYPHS`] codes carry a positive
+    /// width and every one of them is the same (a hair's breadth of
+    /// rounding apart), `Some(false)` when two positive widths differ,
+    /// `None` when the table is too small to say. Zero widths are codes
+    /// without a glyph (or combining marks) and do not count either way;
+    /// a CID font's default width covers glyphs the table does not list
+    /// and is not read.
+    pub(crate) fn fixed_pitch_by_advance(&self) -> Option<bool> {
+        let mut count = 0usize;
+        let mut low = u16::MAX;
+        let mut high = 0u16;
+        for &width in self.widths.values() {
+            if width == 0 {
+                continue;
+            }
+            count += 1;
+            low = low.min(width);
+            high = high.max(width);
+        }
+        if count == 0 {
+            return None;
+        }
+        // Widths are written in thousandths of the em (or the Type3 glyph
+        // space): a unit of rounding between two writings of one advance is
+        // still one advance.
+        let tolerance = (f32::from(high) * 0.002).max(1.0);
+        if f32::from(high - low) > tolerance {
+            return Some(false);
+        }
+        (count >= FIXED_PITCH_MIN_GLYPHS).then_some(true)
+    }
+}
+
 /// All font width info for a page, keyed by font resource name
 pub(crate) type PageFontWidths = HashMap<String, FontWidthInfo>;
+
+/// Whether each font resource of a page is composite (`/Subtype /Type0`): a
+/// composite font's codes are as wide as its CMap says, every other font
+/// shows one byte per code (PDF 32000-1:2008, 9.6). A font whose subtype
+/// cannot be read has no entry.
+pub(crate) type PageFontKinds = HashMap<String, bool>;
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -101,6 +282,61 @@ pub struct PdfRect {
     pub width: f32,
     pub height: f32,
     pub page: u32,
+}
+
+/// Where [`TextItem::is_bold`] came from.
+///
+/// The extraction reads bold from several places and reports the first of
+/// them, in this order, that says the text is bold; `TextItem::bold_source`
+/// carries it so a caller can tell a face whose name says bold apart from
+/// one whose weight class does, and both from text merely stroked to look
+/// heavier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BoldSource {
+    /// A bold word or foundry style abbreviation in the font name ("Bold",
+    /// "-Bd", "Black", "Demi", "-Hv", "W7"; see
+    /// [`is_bold_font`](crate::extractor::is_bold_font)).
+    FontName,
+    /// The FontDescriptor's ForceBold flag, or the embedded font program's
+    /// own bold selection (OS/2 `fsSelection`, the `head` table's
+    /// `macStyle`).
+    FontFlags,
+    /// The weight class: `TextItem::font_weight` at or above the threshold
+    /// of [`PositionOptions::bold_from_weight`](crate::PositionOptions).
+    WeightClass,
+    /// Text filled and stroked to look heavier (render mode 2 or 6 with a
+    /// visible stroke of the fill colour) in a face that is not bold itself.
+    Painted,
+}
+
+impl BoldSource {
+    /// The snake_case name the JSON outputs and the Python binding use:
+    /// `"font_name"`, `"font_flags"`, `"weight_class"`, `"painted"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoldSource::FontName => "font_name",
+            BoldSource::FontFlags => "font_flags",
+            BoldSource::WeightClass => "weight_class",
+            BoldSource::Painted => "painted",
+        }
+    }
+
+    /// The one of two sources an item reports when both say bold: the
+    /// earlier in the order the variants are listed.
+    pub(crate) fn first(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        fn rank(source: BoldSource) -> u8 {
+            match source {
+                BoldSource::FontName => 0,
+                BoldSource::FontFlags => 1,
+                BoldSource::WeightClass => 2,
+                BoldSource::Painted => 3,
+            }
+        }
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if rank(b) < rank(a) { b } else { a }),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 /// A text item with position information.
@@ -211,10 +447,86 @@ pub struct TextItem {
     pub font_size: f32,
     /// Page number (1-indexed)
     pub page: u32,
-    /// Whether the font is bold
+    /// Whether the font is bold: a bold word in the font name, the
+    /// FontDescriptor's ForceBold flag or the embedded program's bold
+    /// selection, or text filled and stroked to look heavier. With
+    /// [`PositionOptions::bold_from_weight`](crate::PositionOptions) it is
+    /// also `true` when `font_weight` is 600 or more.
     pub is_bold: bool,
     /// Whether the font is italic
     pub is_italic: bool,
+    /// The font's weight class on the 100..=900 scale shared by CSS
+    /// `font-weight` and the OS/2 `usWeightClass` field (400 regular, 700
+    /// bold), read from the embedded font program's OS/2 table, else the
+    /// FontDescriptor's `/FontWeight`, else a weight word in the font name
+    /// ("Light", "Medium", "-Md", "Black", "W6"). `None` when none of them
+    /// says, and for items that don't come from a font (images, links, form
+    /// fields, OCR). Independent of `is_bold`, which stays as it was: a
+    /// medium face reports `Some(500)` and `is_bold: false`.
+    pub font_weight: Option<u16>,
+    /// Where `is_bold` came from, so a caller can weigh the verdict against
+    /// `font_weight`: the font name, the font's flags, the weight class or
+    /// the way the text was painted (see [`BoldSource`]). When more than one
+    /// says bold the first of them in that order is reported. `None` when
+    /// `is_bold` is `false`, and for items that don't come from a font. An
+    /// item merged from several runs keeps its first run's, like `font` and
+    /// `font_weight`.
+    pub bold_source: Option<BoldSource>,
+    /// Whether the font is fixed-pitch (monospaced): `Some(true)` when the
+    /// FontDescriptor's FixedPitch flag or the embedded program's `post`
+    /// table says so, else measured from the font's width table — `Some(true)`
+    /// when at least a dozen of its glyphs share one advance, `Some(false)`
+    /// when two of them differ. `None` when the font declares nothing and no
+    /// two advances differ but fewer than a dozen share one, and for items
+    /// that don't come from a font. Many producers write `/Flags 4` whatever
+    /// the face, so the
+    /// flag is only ever read as a yes. Runs are not kept apart by it: an
+    /// item merged from several runs keeps its first run's value, like
+    /// `font` and `font_weight`.
+    pub fixed_pitch: Option<bool>,
+    /// The fill (non-stroking) colour in force when the run was shown, as
+    /// 8-bit sRGB `[red, green, blue]`: the colour its glyphs are filled
+    /// with in the render modes that fill (0, 2, 4, 6; see `render_mode`).
+    /// DeviceRGB is read as sRGB and DeviceGray as three equal components;
+    /// DeviceCMYK is converted the way the PDF specification converts it to
+    /// DeviceRGB, each of red, green and blue `1 - min(1, ink + black)`. An
+    /// ICCBased space is read as the device space of its component count
+    /// (1, 3 or 4) without applying the profile, and an Indexed space
+    /// (`/Indexed`, or its abbreviation `/I`) through its palette's base
+    /// space, which may be named by another colour space resource.
+    /// Components outside their range are clamped to it, and selecting a
+    /// space with `cs`/`CS` sets the initial colour the PDF specification
+    /// gives it: black, except a four-component ICCBased space, whose
+    /// components all start at 0, which reads as white. `None` for any
+    /// other colour space (Separation,
+    /// DeviceN, Pattern, CalGray, CalRGB, Lab), for a colour operator whose
+    /// operands do not fit its space, and for items that don't come from a
+    /// content-stream show operator (images, links, form fields, OCR). The
+    /// colour is graphics state: `q`/`Q` save and restore it and a Form
+    /// XObject starts with the colour it was invoked under. Runs are not
+    /// kept apart by it: an item merged from several runs keeps its first
+    /// run's value, like `font`.
+    pub fill_color: Option<[u8; 3]>,
+    /// The stroking colour in force when the run was shown, as 8-bit sRGB,
+    /// read like `fill_color`: the colour the glyph outlines are stroked
+    /// with in the render modes that stroke (1, 2, 5, 6). `None` when
+    /// unknown or not from a show operator, as for `fill_color`, and an
+    /// item merged from several runs keeps its first run's value.
+    pub stroke_color: Option<[u8; 3]>,
+    /// The text render mode (`Tr`) the run was shown with, `0..=7`: 0 fill,
+    /// 1 stroke, 2 fill then stroke, 3 neither (invisible text, the mode OCR
+    /// text layers use), 4 to 6 as 0 to 2 while also adding the glyphs to
+    /// the clipping path, 7 clipping only. Runs in modes 3 and 7 put no
+    /// glyphs on the page, so callers can tell visible text from invisible
+    /// text by it. The mode is graphics state: it holds across text objects,
+    /// `q`/`Q` save and restore it, and a Form XObject starts with the mode
+    /// it was invoked under; a `Tr` whose operand is not an integer in
+    /// `0..=7` is ignored, as renderers ignore it. Reporting the mode leaves
+    /// which runs are extracted exactly as before: invisible text is neither
+    /// dropped nor added because of it. `None` for items that don't come
+    /// from a content-stream show operator (images, links, form fields,
+    /// OCR); an item merged from several runs keeps its first run's value.
+    pub render_mode: Option<u8>,
     /// Whether the text is underlined (drawn rule/thin rect under the
     /// baseline — PDFs have no underline font flag, so this is detected
     /// geometrically after extraction; see `extractor::underline`).
@@ -702,6 +1014,12 @@ mod formatting_tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: strikeout,
             rotation: 0.0,

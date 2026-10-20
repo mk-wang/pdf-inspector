@@ -137,12 +137,12 @@ headings = [
 | `classify_pdf_bytes(data)` | Lightweight classification from bytes |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_bytes(data)` | Plain text extraction from bytes |
-| `extract_text_with_positions(path, pages=None)` | Text with X/Y coords (visible-page-box frame) and font info |
-| `extract_text_with_positions_bytes(data, pages=None)` | Text with positions from bytes |
-| `extract_text_with_positions_and_rotations(path)` | Positioned text plus the frame of every page whose text was turned (`PositionedText`) |
-| `extract_text_with_positions_and_rotations_bytes(data)` | The same from bytes |
-| `extract_text_in_regions(path, page_regions)` | Extract text in bounding-box regions (top-left PDF points in the visible page box) |
-| `extract_text_in_regions_bytes(data, page_regions)` | Region extraction from bytes |
+| `extract_text_with_positions(path, pages=None, bold_from_weight=False, bold_weight_threshold=600)` | Text with X/Y coords (visible-page-box frame) and font info; `bold_from_weight=True` also reads `is_bold` from a weight class of `bold_weight_threshold` (100..900) or more and merges runs by that verdict |
+| `extract_text_with_positions_bytes(data, pages=None, bold_from_weight=False, bold_weight_threshold=600)` | Text with positions from bytes |
+| `extract_text_with_positions_and_rotations(path, bold_from_weight=False, bold_weight_threshold=600)` | Positioned text plus the frame of every page whose text was turned (`PositionedText`) |
+| `extract_text_with_positions_and_rotations_bytes(data, bold_from_weight=False, bold_weight_threshold=600)` | The same from bytes |
+| `extract_text_in_regions(path, page_regions, bold_from_weight=False, bold_weight_threshold=600)` | Extract text in bounding-box regions (top-left PDF points in the visible page box) |
+| `extract_text_in_regions_bytes(data, page_regions, bold_from_weight=False, bold_weight_threshold=600)` | Region extraction from bytes |
 | `extract_pages_markdown(path, pages=None)` | Per-page Markdown + layout metadata (all pages by default) |
 | `extract_pages_markdown_bytes(data, pages=None)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages=None)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
@@ -160,16 +160,31 @@ class PdfResult:                     # process_pdf / detect_pdf
     processing_time_ms: int
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]
-    title: str | None
+    title: str | None                # document information /Title, decoded as a PDF text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding otherwise); None when missing or not a string
+    author: str | None               # /Author; this and the entries below are decoded, and None, the same way
+    subject: str | None              # /Subject
+    keywords: str | None             # /Keywords
+    creator: str | None              # /Creator: the application the document was authored in
+    producer: str | None             # /Producer: the application that wrote the PDF
+    creation_date: str | None        # /CreationDate as written, e.g. "D:20240115103000+01'00'"
+    mod_date: str | None             # /ModDate as written
     confidence: float                # 0.0 - 1.0
     is_complex_layout: bool
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool        # broken font encodings — consider OCR fallback
+    cmap_gaps: list[FontCMapGaps]    # fonts whose ToUnicode CMap (or, without one, the program's cmap table)
+                                     # lacked an entry for a code shown through it; always [] for detect_pdf
 
 class PageOcrReasons:                # per-page OCR diagnostics
     page: int                        # 1-indexed
     reasons: list[str]               # machine-readable reason identifiers
+
+class FontCMapGaps:                  # what became of a font's codes its ToUnicode CMap (or cmap table) lacks
+    font: str                        # /BaseFont name, or the resource name without one
+    codes: int                       # codes shown through the CMap (two-byte, or the bytes of a single-byte CMap)
+    interpolated: int                # read from the mapped codes around them
+    unmapped: int                    # could not be read; each is a U+FFFD in the text
 
 class OcrModelIdentity:
     name: str                        # model family/name
@@ -229,6 +244,12 @@ class TextItem:                      # extract_text_with_positions
     page: int
     is_bold: bool
     is_italic: bool
+    font_weight: int | None          # weight class 100..900 (400 regular, 700 bold) from the embedded font's OS/2 table, /FontWeight or a weight word in the name; None when unknown
+    bold_source: str | None          # where is_bold came from: "font_name", "font_flags", "weight_class" (with bold_from_weight) or "painted"; None when not bold
+    fixed_pitch: bool | None         # True when the FixedPitch flag or the embedded program says so, else measured from the width table (a dozen glyphs sharing one advance: True; two differing: False; neither: None)
+    fill_color: tuple[int, int, int] | None    # sRGB fill colour the run was shown with (device, ICCBased and Indexed spaces); None for other spaces and non-text items
+    stroke_color: tuple[int, int, int] | None  # sRGB stroke colour, read the same way
+    render_mode: int | None          # text render mode (Tr) 0..7: 3 invisible, 7 clip only (neither paints glyphs); None for non-text items
     is_underline: bool
     is_strikeout: bool
     baseline_shift: float            # super/subscript offset from the body baseline (0.0 = normal text; >0 raised, <0 lowered)

@@ -49,8 +49,7 @@ pub(crate) use detect_lines::{
 pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_chart_regions, detect_tables_from_rects, RectHintRegion};
 pub use detect_struct::detect_tables_from_struct_tree;
-#[cfg(any(test, feature = "ocr"))]
-#[cfg(feature = "ocr")]
+#[cfg(feature = "vision")]
 pub(crate) use format::is_complete_data_table;
 pub use format::table_to_markdown;
 pub use structured::{cells_to_markdown, StructuredCell};
@@ -333,6 +332,12 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
+            font_weight: item.font_weight,
+            bold_source: item.bold_source,
+            fixed_pitch: item.fixed_pitch,
+            fill_color: item.fill_color,
+            stroke_color: item.stroke_color,
+            render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
@@ -360,6 +365,12 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
+            font_weight: item.font_weight,
+            bold_source: item.bold_source,
+            fixed_pitch: item.fixed_pitch,
+            fill_color: item.fill_color,
+            stroke_color: item.stroke_color,
+            render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
             rotation: item.rotation,
@@ -1629,6 +1640,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -1653,6 +1670,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,

@@ -587,12 +587,16 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with its axis-aligned box (visible-page-box frame, see above), `rotation`, and font info |
 | `extract_text_with_positions_mem_in_frame(bytes, pages, frame)` | Positioned text from bytes, limited to 1-indexed `pages`, in the sheet or display frame (`PositionFrame`) |
+| `extract_text_with_positions_mem_with_options(bytes, pages, options)` | The same with every option given as a `PositionOptions` (frame, `bold_from_weight`, `bold_weight_threshold`) |
 | `extract_text_with_positions_and_rotations_mem(bytes)` | Positioned text plus the `PageRotation` of every page whose text was predominantly rotated |
 | `extract_text_with_positions_and_rotations_mem_in_frame(bytes, pages, frame)` | The same with a page filter and a frame choice |
+| `extract_text_with_positions_and_rotations_mem_with_options(bytes, pages, options)` | The same with a `PositionOptions` |
 | `extract_text_in_regions_mem(bytes, page_regions)` | Text inside top-left region rects (sheet frame) |
 | `extract_text_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
+| `extract_text_in_regions_mem_with_options(bytes, page_regions, options)` | The same with a `PositionOptions` |
 | `extract_tables_in_regions_mem(bytes, page_regions)` | Markdown tables inside region rects (sheet frame) |
 | `extract_tables_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
+| `extract_tables_in_regions_mem_with_options(bytes, page_regions, options)` | The same with a `PositionOptions` |
 | `collect_text_in_region_in_frame(items, x1, y1, x2, y2, page_height, rotation)` | Region text with the page's coordinate frame given explicitly (`page_height` is the visible page box height) |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
@@ -601,6 +605,7 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
+| `widen_degenerate_form_bboxes_mem(bytes)` | Rust only (not in the Python, Node.js or WebAssembly bindings). The document re-serialized with the `/BBox` of its Form XObjects repaired — a zero-area box widened, numerals too large for any parser saturated — for rendering elsewhere; `None` when no form needs it and for an encrypted document, whose protection a plain serialization would drop |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
@@ -611,14 +616,17 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PdfOptions` | Builder for processing configuration (mode, detection, markdown, page filter) |
 | `ProcessMode` | `DetectOnly`, `Analyze`, `Full` |
 | `PdfType` | `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
-| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, timing |
-| `PdfTypeResult` | Low-level detection result: type, confidence, page count, pages needing OCR |
+| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, cmap_gaps, timing, and the document information dictionary's entries `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` and `mod_date` (each decoded as a PDF text string — UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding otherwise — the dates as written; `None` when missing or not a string) |
+| `FontCMapGaps` | A font whose ToUnicode CMap (or, without one, the embedded program's cmap table) had no entry for some of the codes the document shows through it: `font` (the `/BaseFont` name, or the resource name without one), `codes` shown, `interpolated` (read from the mapped codes around them: a CMap mapping code 36 to `A` and code 38 to `C` says code 37 is `B`, for a run of digits or of letters of one case in alphabetical glyph order) and `unmapped` (could not be read; each is a U+FFFD in the text). `PdfProcessResult::cmap_gaps` lists such fonts; it is always empty in `ProcessMode::DetectOnly`, which decodes no text, and otherwise empty when every code shown through a CMap had an entry |
+| `PdfTypeResult` | Low-level detection result: type, confidence, page count, pages needing OCR, and the document information entries `PdfProcessResult` reports |
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info, page number, and optional structure-tree `mcid` |
+| `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info including `font_weight` (the 100..=900 weight class from the embedded font's OS/2 table, `/FontWeight` or a weight word in the name; `None` when unknown), `bold_source` (where `is_bold` came from, a `BoldSource`; `None` when not bold) and `fixed_pitch` (`Some(true)` when the FontDescriptor's FixedPitch flag or the embedded program's `post` table says so, else measured from the width table: `Some(true)` when a dozen or more glyphs share one advance, `Some(false)` when two differ, `None` when neither holds), the paint the run was shown with — `fill_color` and `stroke_color` as 8-bit sRGB `[r, g, b]` (DeviceRGB as sRGB, DeviceGray as equal components, DeviceCMYK as the specification converts it, ICCBased by its component count, Indexed through its palette; `None` for other colour spaces) and `render_mode`, the `Tr` mode `0..=7` (3 invisible and 7 clip-only runs paint no glyphs), all three `None` for items not shown by a text operator and none of them changing what is extracted — page number, and optional structure-tree `mcid` |
 | `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
 | `PositionFrame` | `Sheet` (default): the visible page box as laid out in the content stream, `/Rotate` not applied, predominantly rotated pages turned; `Display`: the rendered page, the visible box turned clockwise by the inheritable `/Rotate`, with only the synthetic turn of a predominantly rotated page undone first while individual runs keep their own `rotation` (see [Coordinate frame](#coordinate-frame)) |
+| `PositionOptions` | Options of the `_with_options` position and region functions: `frame` (a `PositionFrame`), `bold_from_weight`, which also reads `TextItem::is_bold` from a `font_weight` at or above `bold_weight_threshold` (600 by default, valid 100..=900) and merges adjacent runs by that verdict rather than by their weight classes; off by default, where `is_bold` and merging are unchanged |
+| `BoldSource` | Where `TextItem::is_bold` came from: `FontName`, `FontFlags`, `WeightClass` (with `bold_from_weight`) or `Painted`; the first of them in that order when more than one says bold |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |

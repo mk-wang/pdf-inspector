@@ -1755,12 +1755,7 @@ pub(crate) fn assign_items_to_grid(
             // kept in screen order.
             let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, i)| &i.text));
             if rtl {
-                crate::text_utils::sort_rtl_cell_items(
-                    col_items,
-                    |(_, i)| i.x,
-                    |(_, i)| i.line_y(),
-                    |(_, i)| i.text.as_str(),
-                );
+                crate::text_utils::sort_rtl_cell_items(col_items, |(_, i)| *i);
             } else {
                 col_items.sort_by(|a, b| {
                     b.1.line_y()
@@ -3587,6 +3582,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -5319,6 +5320,12 @@ mod tests {
                     page: 1,
                     is_bold: false,
                     is_italic: false,
+                    font_weight: None,
+                    bold_source: None,
+                    fixed_pitch: None,
+                    fill_color: None,
+                    stroke_color: None,
+                    render_mode: None,
                     is_underline: false,
                     is_strikeout: false,
                     rotation: 0.0,
@@ -5634,6 +5641,12 @@ mod tests {
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
                 rotation: 0.0,

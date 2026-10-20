@@ -844,7 +844,7 @@ fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
 #[derive(Clone, Copy)]
 enum TableOutputMode {
     Markdown,
-    #[cfg(feature = "ocr")]
+    #[cfg(feature = "vision")]
     CompleteTables,
 }
 
@@ -853,7 +853,7 @@ struct TableDetectionOutput {
     pages_with_detected_tables: HashSet<u32>,
     pages_with_tables: HashSet<u32>,
     markdown_by_page: HashMap<u32, Vec<PositionedMarkdown>>,
-    #[cfg(feature = "ocr")]
+    #[cfg(feature = "vision")]
     complete_tables: Vec<(u32, crate::tables::Table)>,
 }
 
@@ -864,7 +864,7 @@ impl TableDetectionOutput {
             pages_with_detected_tables: HashSet::new(),
             pages_with_tables: HashSet::new(),
             markdown_by_page: HashMap::new(),
-            #[cfg(feature = "ocr")]
+            #[cfg(feature = "vision")]
             complete_tables: Vec::new(),
         }
     }
@@ -889,7 +889,7 @@ impl TableDetectionOutput {
                         chart_order,
                     ));
             }
-            #[cfg(feature = "ocr")]
+            #[cfg(feature = "vision")]
             TableOutputMode::CompleteTables => {
                 if crate::tables::is_complete_data_table(table) {
                     self.pages_with_tables.insert(page);
@@ -911,7 +911,7 @@ impl TableDetectionOutput {
 #[derive(Default)]
 struct MarkdownConversionOutput {
     markdown: String,
-    #[cfg(feature = "ocr")]
+    #[cfg(feature = "vision")]
     detected_tables: Vec<(u32, crate::tables::Table)>,
 }
 
@@ -1475,7 +1475,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 /// Run the ordinary Markdown table pipeline but return only structurally
 /// complete data tables. Supplemental OCR uses this to keep detector behavior
 /// identical without parsing the serialized Markdown back into tables.
-#[cfg(feature = "ocr")]
+#[cfg(feature = "vision")]
 pub(crate) fn complete_table_markdown_from_items(
     items: Vec<TextItem>,
     options: MarkdownOptions,
@@ -2132,9 +2132,9 @@ fn convert_items_with_rects_lines_and_table_output(
         }
     }
 
-    #[cfg(feature = "ocr")]
+    #[cfg(feature = "vision")]
     let mut detected_tables = table_output.complete_tables;
-    #[cfg(feature = "ocr")]
+    #[cfg(feature = "vision")]
     detected_tables.sort_by_key(|(page, _)| *page);
     let mut page_tables = table_output.markdown_by_page;
 
@@ -2406,7 +2406,7 @@ fn convert_items_with_rects_lines_and_table_output(
     );
     MarkdownConversionOutput {
         markdown,
-        #[cfg(feature = "ocr")]
+        #[cfg(feature = "vision")]
         detected_tables,
     }
 }
@@ -2417,7 +2417,7 @@ mod tests {
     use analysis::detect_header_level;
     use classify::{is_code_like, is_list_item};
 
-    #[cfg(feature = "ocr")]
+    #[cfg(feature = "vision")]
     #[test]
     fn complete_table_output_marks_only_pages_with_emitted_tables() {
         let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables);
@@ -2691,6 +2691,12 @@ mod tests {
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,

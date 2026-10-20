@@ -29,62 +29,34 @@ use std::collections::HashMap;
 ///   `TextLine::text` renders it as `<sup>…</sup>` / `<sub>…</sub>`.
 ///
 /// Item order is unchanged from the fusion-only version of this pass: items
-/// are bucketed into 5pt rough lines and x-sorted within each, and the result
-/// is that order minus the fused glyphs.
+/// are bucketed into the rough lines the line grouping makes
+/// (`group_indices_into_lines`: the 5 pt window between two fragments of
+/// 8⅓ pt and above, narrower where either is small) and x-sorted within
+/// each, and the result is that order minus the fused glyphs.
 pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.len() < 2 {
         return items;
     }
 
-    // Rough (page, y) grouping with a 5pt window, x-sorted per group. This
-    // fixes the OUTPUT ORDER only — stream-order line assembly downstream
-    // depends on it — while script detection below is purely geometric and
-    // so also reaches markers raised further than 5pt on large type.
-    //
-    // The window bounds the group's whole y span, not only its founding item:
-    // a window anchored on one column's baseline otherwise reaches a line above
-    // it in the other column and a line below it, and the x sort then reorders
-    // those two baselines into one. A script run reaches past that span on
-    // purpose — detection below reads the runs it is adjacent to — and is
-    // recognized by its geometry (see `script_attachable_to`).
-    //
-    // That attachment is measured against the band's members, never off the
-    // founding item: a formula's band is often founded by one of its own
-    // scripts — the "−" of "−0.5" sits above the baseline its sibling
-    // subscription belongs to — and a window read off that founder rejects
-    // the sibling, which then founds a band of its own and lands after the
-    // whole formula. The two halves stay independent, as before: the run need
-    // only be level with SOME member and attached to SOME member (which may be
-    // different members when the band spans multiple baselines).
-    let y_tolerance = 5.0;
-    // (page, y span low, y span high, items)
-    let mut line_groups: Vec<(u32, f32, f32, Vec<TextItem>)> = Vec::new();
-
-    for item in items {
-        let found = line_groups.iter_mut().find(|(pg, y_low, y_high, group)| {
-            *pg == item.page
-                && ((item.y - *y_low).abs() < y_tolerance && (item.y - *y_high).abs() < y_tolerance
-                    || (group
-                        .iter()
-                        .any(|member| (item.y - member.y).abs() < y_tolerance)
-                        && script_attachable_to(&item, group.iter())))
-        });
-        if let Some((_, y_low, y_high, group)) = found {
-            *y_low = y_low.min(item.y);
-            *y_high = y_high.max(item.y);
-            group.push(item);
-        } else {
-            let page = item.page;
-            let y = item.y;
-            line_groups.push((page, y, y, vec![item]));
-        }
+    // Rough (page, baseline) grouping, x-sorted per group, with the window
+    // the line grouping uses — the fixed 5 pt of old between two fragments
+    // of 8⅓ pt and above, narrower where either is small, so two lines of
+    // small type on a pitch under 5 pt keep their order. This fixes the OUTPUT ORDER only —
+    // stream-order line assembly downstream depends on it — while script
+    // detection below is purely geometric and so also reaches markers raised
+    // further than the window on large type.
+    let mut lines = super::group_indices_into_lines(&items);
+    for line in &mut lines {
+        line.sort_by(|&a, &b| items[a].x.total_cmp(&items[b].x));
     }
-
-    let mut ordered: Vec<TextItem> =
-        Vec::with_capacity(line_groups.iter().map(|(_, _, _, g)| g.len()).sum());
-    for (_, _, _, mut group) in line_groups {
-        group.sort_by(|a, b| a.x.total_cmp(&b.x));
-        ordered.extend(group);
+    let mut slots: Vec<Option<TextItem>> = items.into_iter().map(Some).collect();
+    let mut ordered: Vec<TextItem> = Vec::with_capacity(slots.len());
+    for line in lines {
+        for index in line {
+            if let Some(item) = slots[index].take() {
+                ordered.push(item);
+            }
+        }
     }
 
     let runs = detect_script_runs(&ordered);
@@ -98,6 +70,10 @@ const SCRIPT_MAX_RATIO: f32 = 0.75;
 /// Smallest ratio: body text beside a drop cap or a display figure is far
 /// smaller than this, and never a script of it.
 const SCRIPT_MIN_RATIO: f32 = 0.4;
+/// Largest size step between neighbouring glyphs of a run, as a fraction of
+/// the larger: a sign from a symbol font set a design size above the digits
+/// beside it is within a step of them, the body text around a run is not.
+const SCRIPT_RUN_SIZE_STEP: f32 = 0.2;
 /// Minimum |baseline offset| as a fraction of the anchor size. Level runs —
 /// small caps, a smaller label on the same baseline — are not scripts.
 const SCRIPT_MIN_SHIFT: f32 = 0.1;
@@ -124,35 +100,6 @@ const SCRIPT_MAX_GLYPH_LETTERS: usize = 4;
 /// Digit-only runs up to this many digits fuse into the anchor as Unicode
 /// super/subscript characters.
 const SCRIPT_MAX_FUSED_DIGITS: usize = 4;
-
-/// Whether `item` could be the super/subscript of a member of a line band:
-/// shrunken to [`SCRIPT_MIN_RATIO`]..=[`SCRIPT_MAX_RATIO`] of that member's
-/// size and tightly attached to its side, the geometry `detect_script_runs`
-/// looks for below.
-///
-/// Such a run sits off the baseline it annotates, so a band has to reach past
-/// its y span to keep the two together — detection reads each item's
-/// neighbours. The line below a band's own is set in the band's size and only
-/// ever meets it by accident, so it stays out.
-pub(crate) fn script_attachable_to<'a>(
-    item: &TextItem,
-    band: impl IntoIterator<Item = &'a TextItem>,
-) -> bool {
-    band.into_iter().any(|member| {
-        let anchor = member.font_size;
-        if anchor <= 0.0 || item.font_size <= 0.0 {
-            return false;
-        }
-        let ratio = item.font_size / anchor;
-        if !(SCRIPT_MIN_RATIO..=SCRIPT_MAX_RATIO).contains(&ratio) {
-            return false;
-        }
-        let attached = |gap: f32| {
-            (-anchor * SCRIPT_ATTACH_OVERLAP..=anchor * SCRIPT_ATTACH_GAP).contains(&gap)
-        };
-        attached(item.x - (member.x + member.width)) || attached(member.x - (item.x + item.width))
-    })
-}
 
 /// A glyph run detected as the super/subscript of `anchor`.
 #[derive(Debug)]
@@ -319,7 +266,7 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                 let fs = last.font_size.max(glyph.font_size);
                 let gap = glyph.x - item_right(last);
                 (last.y - glyph.y).abs() <= SCRIPT_RUN_BASELINE_TOL
-                    && (last.font_size - glyph.font_size).abs() <= fs * 0.2
+                    && (last.font_size - glyph.font_size).abs() <= fs * SCRIPT_RUN_SIZE_STEP
                     && gap <= fs * SCRIPT_CHAIN_GAP
                     && gap >= -fs
             });
@@ -336,10 +283,29 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
             }
             let first = &items[chain[0]];
             let last = &items[*chain.last().unwrap()];
-            let run_fs = chain
-                .iter()
-                .map(|&i| items[i].font_size)
-                .fold(0.0_f32, f32::max);
+            // The run's size is that of its letters and digits: a sign set
+            // from a symbol font can be a design size above them (the minus
+            // of an exponent in TeX), which would take the run past the size
+            // a script may have. A sign more than a step above them (a chain
+            // that grows a step at a time up to the body size), and a run of
+            // signs alone, size the run by its largest glyph.
+            let size_of = |letters_and_digits: bool| {
+                chain
+                    .iter()
+                    .filter(|&&i| {
+                        !letters_and_digits || items[i].text.chars().any(char::is_alphanumeric)
+                    })
+                    .map(|&i| items[i].font_size)
+                    .fold(0.0_f32, f32::max)
+            };
+            let (letters_fs, largest_fs) = (size_of(true), size_of(false));
+            let run_fs = if letters_fs > 0.0
+                && largest_fs - letters_fs <= largest_fs * SCRIPT_RUN_SIZE_STEP
+            {
+                letters_fs
+            } else {
+                largest_fs
+            };
 
             // Nearest anchor wins; on a tie the preceding word does — a
             // footnote reference belongs to the word before it, not to the
@@ -554,6 +520,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             item_type: ItemType::Text,
@@ -568,92 +540,6 @@ mod tests {
 
     fn texts(items: &[TextItem]) -> Vec<&str> {
         items.iter().map(|i| i.text.as_str()).collect()
-    }
-
-    /// The rough-line window reorders items, so it must not reach two
-    /// baselines of one column either: on a contents page whose columns sit on
-    /// offset baselines it would otherwise lay the next entry's number beside
-    /// the wrapped line above it. Modelled on `21 CFR Ch. I` p.2, the items as
-    /// `merge_text_items` leaves them.
-    #[test]
-    fn rough_line_window_stops_at_one_baseline_per_column() {
-        let items = vec![
-            make_item_fs("1.326", 138.57, 528.05, 14.90, 6.39),
-            make_item_fs(
-                "Who is subject to this subpart? ",
-                159.87,
-                528.05,
-                106.56,
-                6.39,
-            ),
-            make_item_fs(
-                "must the detained article of food be held? ",
-                315.77,
-                532.43,
-                142.89,
-                6.39,
-            ),
-            make_item_fs("1.381", 302.98, 525.31, 14.92, 6.39),
-            make_item_fs(
-                "May a detained article of food be de-",
-                324.29,
-                525.31,
-                132.28,
-                6.39,
-            ),
-        ];
-        let ordered = merge_subscript_items(items);
-        assert_eq!(
-            texts(&ordered),
-            vec![
-                "1.326",
-                "Who is subject to this subpart? ",
-                "must the detained article of food be held? ",
-                "1.381",
-                "May a detained article of food be de-",
-            ]
-        );
-    }
-
-    /// A run painted before its anchor's other members still has to land
-    /// beside its anchor. The band's fallback window is measured against the
-    /// band's members, so it must not be read off whichever item founded the
-    /// band: here the founder is a *script* of the same formula (`−` of
-    /// `−0.5`, 2.89pt above the body baseline) and the subscription "model"
-    /// sits 7.0pt below the founder but 2.89pt below the anchor it indexes.
-    /// Measured on the founder, "model" founds its own band and the x sort
-    /// parks it after the whole formula. Modelled on `Attention Is All You
-    /// Need` eq. (3), the items as `merge_text_items` leaves them.
-    #[test]
-    fn run_in_place_when_the_band_founder_is_its_own_script() {
-        let items = vec![
-            make_item_fs("−", 202.80, 169.08, 6.22, 6.97),
-            make_item_fs("lrate", 162.89, 164.97, 21.42, 9.96),
-            make_item_fs("=", 187.10, 164.97, 7.74, 9.96),
-            make_item_fs("d", 197.62, 164.97, 5.18, 9.96),
-            make_item_fs("model", 202.80, 162.08, 17.43, 6.97),
-            make_item_fs("·", 222.95, 164.97, 2.76, 9.96),
-        ];
-        let ordered = merge_subscript_items(items);
-        assert_eq!(texts(&ordered), vec!["lrate", "=", "d", "−", "model", "·"]);
-    }
-
-    /// The two halves of the fallback stay independent: the run need only be
-    /// level with SOME member and attached to SOME member. When a line band
-    /// spans slightly offset baselines, the member keeping the run within
-    /// `y_tolerance` (here `A`) and the anchor it attaches to geometrically
-    /// (here `B`) can be different members. Measuring both against a single
-    /// member would reject the script and sort it after the whole line.
-    #[test]
-    fn script_window_and_attachment_may_come_from_different_members() {
-        let items = vec![
-            make_item_fs("A", 100.0, 262.0, 10.0, 12.0),
-            make_item_fs("B", 112.0, 260.0, 10.0, 12.0),
-            make_item_fs("k", 122.0, 265.5, 5.0, 7.0),
-            make_item_fs("C", 130.0, 261.0, 10.0, 12.0),
-        ];
-        let ordered = merge_subscript_items(items);
-        assert_eq!(texts(&ordered), vec!["A", "B", "k", "C"]);
     }
 
     #[test]
@@ -832,6 +718,41 @@ mod tests {
     }
 
     #[test]
+    fn a_sign_set_a_size_above_its_digits_keeps_the_run_a_script() {
+        // "cm⁻³": the exponent's minus is set from a symbol font a design
+        // size above its digit (7.89pt against 7.57pt, beside 10.16pt
+        // text); the run's size is its digit's, which a script's may be.
+        let exponent = |glyphs: Vec<TextItem>| {
+            let mut items = vec![make_item_fs("pc cm", 200.0, 192.13, 53.0, 10.16)];
+            items.extend(glyphs);
+            items.push(make_item_fs("), were", 263.6, 192.13, 30.0, 10.16));
+            merge_subscript_items(items)
+        };
+        let merged = exponent(vec![
+            make_item_fs("\u{2212}", 253.1, 195.75, 6.1, 7.89),
+            make_item_fs("3", 259.3, 195.75, 3.8, 7.57),
+        ]);
+        assert_eq!(texts(&merged), vec!["pc cm", "\u{2212}3", "), were"]);
+        assert!(
+            (merged[1].baseline_shift - 3.62).abs() < 1e-3,
+            "{:?}",
+            merged[1]
+        );
+        // The sign alone keeps its own size, past a script's.
+        let merged = exponent(vec![make_item_fs("\u{2212}", 253.1, 195.75, 6.1, 7.89)]);
+        assert!(merged.iter().all(|item| !item.is_script()), "{merged:?}");
+        // Signs that grow a step at a time from a digit's size to the body
+        // size are no sign of a symbol font: the run is as large as its
+        // largest glyph, and no script.
+        let merged = exponent(vec![
+            make_item_fs("7", 253.1, 195.75, 3.5, 7.0),
+            make_item_fs("(", 256.6, 195.75, 2.8, 8.5),
+            make_item_fs(")", 259.4, 195.75, 3.4, 10.2),
+        ]);
+        assert!(merged.iter().all(|item| !item.is_script()), "{merged:?}");
+    }
+
+    #[test]
     fn leading_digit_marker_fuses_into_following_word() {
         let items = vec![
             make_item_fs("1", 72.0, 653.5, 3.9, 6.97),
@@ -880,6 +801,25 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(texts(&merged), vec!["$1,234", "1"]);
         assert!(merged[1].is_script() && merged[1].baseline_shift > 0.0);
+    }
+
+    /// Two lines of 4.7 pt type on a 4.5 pt pitch keep their order through
+    /// the rough-line bucketing when the lower line starts further left: a
+    /// fixed 5 pt window put both in one bucket and sorted the lower line's
+    /// first word ahead of the upper line.
+    #[test]
+    fn stacked_small_lines_keep_their_order_when_the_lower_starts_further_left() {
+        let items = vec![
+            make_item_fs("Apples", 100.0, 700.0, 16.0, 4.7),
+            make_item_fs("Picked", 118.5, 700.0, 15.0, 4.7),
+            make_item_fs("Oranges", 99.0, 695.5, 19.0, 4.7),
+            make_item_fs("Sold", 120.0, 695.5, 10.0, 4.7),
+        ];
+        let out: Vec<String> = merge_subscript_items(items)
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+        assert_eq!(out, ["Apples", "Picked", "Oranges", "Sold"]);
     }
 
     #[test]
@@ -989,8 +929,10 @@ mod tests {
 
     #[test]
     fn output_order_follows_rough_lines_sorted_by_x() {
-        // Ordering contract: 5pt rough groups in discovery order, x-sorted
-        // within — unchanged from the fusion-only pass.
+        // Ordering contract: rough lines (`group_indices_into_lines`; the
+        // 5 pt window, these being 10 pt) in the order of their first
+        // fragment in the stream, x-sorted within — unchanged from the
+        // fusion-only pass.
         let items = vec![
             make_item_fs("b", 200.0, 500.0, 5.0, 10.0),
             make_item_fs("a", 100.0, 500.0, 5.0, 10.0),

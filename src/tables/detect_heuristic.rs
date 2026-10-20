@@ -152,6 +152,12 @@ fn merge_adjacent_items_preserving(
                 page: first_item.page,
                 is_bold: first_item.is_bold,
                 is_italic: first_item.is_italic,
+                font_weight: first_item.font_weight,
+                bold_source: first_item.bold_source,
+                fixed_pitch: first_item.fixed_pitch,
+                fill_color: first_item.fill_color,
+                stroke_color: first_item.stroke_color,
+                render_mode: first_item.render_mode,
                 is_underline: first_item.is_underline,
                 is_strikeout: first_item.is_strikeout,
                 rotation: first_item.rotation,
@@ -1437,12 +1443,7 @@ fn detect_table_in_region(
             // restoration (matching the rect and structure-tree detectors).
             let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
-                crate::text_utils::sort_rtl_cell_items(
-                    col_items,
-                    |i| i.x,
-                    |i| i.line_y(),
-                    |i| i.text.as_str(),
-                );
+                crate::text_utils::sort_rtl_cell_items(col_items, |i| *i);
             } else {
                 col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
             }
@@ -2708,6 +2709,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -3051,6 +3058,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,
@@ -3198,6 +3211,12 @@ mod tests {
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: strikeout,
             rotation: 0.0,

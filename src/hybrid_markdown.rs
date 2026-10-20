@@ -19,8 +19,8 @@ use crate::structure_tree::{StructRole, StructTable};
 use crate::types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 use crate::{
     add_ocr_reason, analyze_text_quality, compute_layout_complexity_with_chart_regions,
-    detect_encoding_issues, is_garbage_text, merge_ocr_reasons, page_ocr_reasons_vec, PdfError,
-    PdfOptions, PdfProcessResult, ProcessingTimer, OCR_REASON_SUSPECTED_GARBLED_TEXT,
+    detect_encoding_issues, is_garbage_text, merge_ocr_reasons, page_ocr_reasons_vec, FontCMapGaps,
+    PdfError, PdfOptions, PdfProcessResult, ProcessingTimer, OCR_REASON_SUSPECTED_GARBLED_TEXT,
 };
 
 /// A normalized OCR rectangle in top-left origin coordinates.
@@ -138,6 +138,13 @@ pub(crate) struct PreparedMarkdown {
     pub(crate) pages_needing_ocr: Vec<u32>,
     pub(crate) ocr_reasons_by_page: BTreeMap<u32, Vec<String>>,
     pub(crate) title: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) subject: Option<String>,
+    pub(crate) keywords: Option<String>,
+    pub(crate) creator: Option<String>,
+    pub(crate) producer: Option<String>,
+    pub(crate) creation_date: Option<String>,
+    pub(crate) mod_date: Option<String>,
     pub(crate) confidence: f32,
     pub(crate) source_items: Vec<TextItem>,
     pub(crate) rects: Vec<PdfRect>,
@@ -150,6 +157,11 @@ pub(crate) struct PreparedMarkdown {
     pub(crate) markdown: Option<String>,
     pub(crate) layout: LayoutComplexity,
     pub(crate) has_encoding_issues: bool,
+    /// Per-font CMap coverage gaps from the selected pages' extraction.
+    pub(crate) cmap_gaps: Vec<FontCMapGaps>,
+    /// Whether any code shown through a CMap had no entry at all; kept for
+    /// the final render so a session's encoding verdict survives OCR.
+    pub(crate) cmap_unmapped: bool,
     page_boxes: BTreeMap<u32, PageBox>,
 }
 
@@ -318,9 +330,17 @@ pub(crate) fn process_document(
             pages_needing_ocr: detection.pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection.ocr_reasons_by_page),
             title: detection.title,
+            author: detection.author,
+            subject: detection.subject,
+            keywords: detection.keywords,
+            creator: detection.creator,
+            producer: detection.producer,
+            creation_date: detection.creation_date,
+            mod_date: detection.mod_date,
             confidence: detection.confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
         });
     }
 
@@ -333,9 +353,17 @@ pub(crate) fn process_document(
         pages_needing_ocr: prepared.pages_needing_ocr,
         ocr_reasons_by_page: page_ocr_reasons_vec(prepared.ocr_reasons_by_page),
         title: prepared.title,
+        author: prepared.author,
+        subject: prepared.subject,
+        keywords: prepared.keywords,
+        creator: prepared.creator,
+        producer: prepared.producer,
+        creation_date: prepared.creation_date,
+        mod_date: prepared.mod_date,
         confidence: prepared.confidence,
         layout: prepared.layout,
         has_encoding_issues: prepared.has_encoding_issues,
+        cmap_gaps: prepared.cmap_gaps,
     })
 }
 
@@ -361,6 +389,13 @@ fn prepare_markdown_state(
     let pdf_type = detection.pdf_type;
     let mut pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
+    let author = detection.author;
+    let subject = detection.subject;
+    let keywords = detection.keywords;
+    let creator = detection.creator;
+    let producer = detection.producer;
+    let creation_date = detection.creation_date;
+    let mod_date = detection.mod_date;
     let confidence = detection.confidence;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
     let page_boxes = collect_page_boxes(doc);
@@ -378,6 +413,13 @@ fn prepare_markdown_state(
             pages_needing_ocr,
             ocr_reasons_by_page: detection_ocr_reasons,
             title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
             confidence,
             source_items: Vec::new(),
             rects: Vec::new(),
@@ -390,6 +432,8 @@ fn prepare_markdown_state(
             markdown: None,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
+            cmap_unmapped: false,
             page_boxes,
         });
     }
@@ -412,7 +456,7 @@ fn prepare_markdown_state(
         // Retry with the invisible layer whenever the visible pass produced no
         // text for the selection, not only for Mixed documents.
         let selection_has_visible_text = match &result {
-            Ok(((items, _, _), _, _)) => items.iter().any(|item| {
+            Ok(((items, _, _), _, _, _, _)) => items.iter().any(|item| {
                 !matches!(item.item_type, crate::types::ItemType::Image)
                     && !item.text.trim().is_empty()
                     && options
@@ -425,7 +469,13 @@ fn prepare_markdown_state(
 
         if matches!(pdf_type, PdfType::Mixed | PdfType::ImageBased) || !selection_has_visible_text {
             match result {
-                Ok(((items, rects, lines), thresholds, gid_encoded_pages)) => {
+                Ok((
+                    (items, rects, lines),
+                    thresholds,
+                    gid_encoded_pages,
+                    rotations,
+                    cmap_coverage,
+                )) => {
                     // `[Image: …]` items (ItemType::Image) are placeholders for
                     // image XObjects, not text read from the page. Counting them
                     // as the visible pass's output is how a fully rasterized
@@ -456,7 +506,13 @@ fn prepare_markdown_state(
                             options.max_decompressed_size,
                         )
                     } else {
-                        Ok(((items, rects, lines), thresholds, gid_encoded_pages))
+                        Ok((
+                            (items, rects, lines),
+                            thresholds,
+                            gid_encoded_pages,
+                            rotations,
+                            cmap_coverage,
+                        ))
                     }
                 }
                 Err(error) if !error.is_decompression_limit() => {
@@ -499,8 +555,23 @@ fn prepare_markdown_state(
         })
         .unwrap_or((None, Vec::new()));
 
-    let (source_items, rects, lines, page_thresholds, rendered, gid_pages) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+    let (
+        source_items,
+        rects,
+        lines,
+        page_thresholds,
+        rendered,
+        gid_pages,
+        cmap_gaps,
+        cmap_unmapped,
+    ) = match extracted {
+        Some((
+            (items, rects, lines),
+            page_thresholds,
+            gid_encoded_pages,
+            _page_rotations,
+            cmap_coverage,
+        )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
             let unmapped_font_pages: HashSet<u32> = if pdf_type == PdfType::TextBased {
                 pages_needing_ocr.iter().copied().collect()
@@ -573,13 +644,27 @@ fn prepare_markdown_state(
                 struct_roles: struct_roles.as_ref(),
                 struct_tables: &struct_tables,
             };
+            // A code no CMap could read is an encoding issue whether or not
+            // the Markdown that would show its U+FFFD is generated in this
+            // mode; a gap read from its neighbours is not one.
+            let cmap_unmapped = cmap_coverage.values().any(|stats| stats.unmapped > 0);
             let rendered = render_markdown(
                 items.clone(),
                 &render_context,
                 ocr_reasons_by_page,
                 options.mode != ProcessMode::Analyze,
+                cmap_unmapped,
             );
-            (items, rects, lines, page_thresholds, rendered, gid_pages)
+            (
+                items,
+                rects,
+                lines,
+                page_thresholds,
+                rendered,
+                gid_pages,
+                crate::font_cmap_gaps(cmap_coverage),
+                cmap_unmapped,
+            )
         }
         None => (
             Vec::new(),
@@ -594,6 +679,8 @@ fn prepare_markdown_state(
                 ocr_reasons_by_page: BTreeMap::new(),
             },
             HashSet::new(),
+            Vec::new(),
+            false,
         ),
     };
 
@@ -633,6 +720,15 @@ fn prepare_markdown_state(
             pages_needing_ocr.push(page);
         }
     }
+    // SDK policy: text length alone never creates an OCR route. Upstream's
+    // sparse rule (under 50 characters per page, under 500 in all) flagged
+    // every page of a small or short text document for OCR, overriding the
+    // page-level evidence above; this tree removed that rule deliberately,
+    // and a short native page that extraction read cleanly stays native.
+    // OCR comes from the signals collected here instead: missing, garbled
+    // or vector-outlined text, gid/unmapped fonts, a hidden text layer
+    // under a covering image, raster-only pages, or a page classified
+    // Scanned/ImageBased.
     // A selected page whose items are all raster placeholders has no text a
     // host can read: an illustration plate in a scanned book, a full-page
     // chart, or a scan whose hidden text layer is absent. Converting it yields
@@ -685,6 +781,13 @@ fn prepare_markdown_state(
         pages_needing_ocr,
         ocr_reasons_by_page,
         title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
         confidence,
         source_items,
         rects,
@@ -697,6 +800,8 @@ fn prepare_markdown_state(
         markdown,
         layout: rendered.layout,
         has_encoding_issues,
+        cmap_gaps,
+        cmap_unmapped,
         page_boxes,
     })
 }
@@ -706,6 +811,7 @@ fn render_markdown(
     context: &MarkdownRenderContext<'_>,
     mut ocr_reasons_by_page: BTreeMap<u32, Vec<String>>,
     emit_markdown: bool,
+    cmap_unmapped: bool,
 ) -> RenderedMarkdown {
     let crate::FolioFilteredItems {
         items,
@@ -754,6 +860,7 @@ fn render_markdown(
     };
     let has_encoding_issues = !ocr_reasons_by_page.is_empty()
         || text_quality.has_encoding_issues
+        || cmap_unmapped
         || markdown
             .as_ref()
             .is_some_and(|markdown| detect_encoding_issues(markdown));
@@ -778,7 +885,13 @@ impl PreparedMarkdown {
             struct_roles: self.struct_roles.as_ref(),
             struct_tables: &self.struct_tables,
         };
-        render_markdown(source_items, &context, BTreeMap::new(), emit_markdown)
+        render_markdown(
+            source_items,
+            &context,
+            BTreeMap::new(),
+            emit_markdown,
+            self.cmap_unmapped,
+        )
     }
 }
 impl PreparedMarkdown {
@@ -917,6 +1030,14 @@ fn ocr_tokens_to_items(
             page: request.page,
             is_bold: false,
             is_italic: false,
+            // OCR tokens carry no font program or graphics state, so the
+            // upstream style/provenance fields have nothing to report.
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             item_type: crate::types::ItemType::Text,

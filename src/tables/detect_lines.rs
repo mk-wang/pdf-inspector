@@ -1397,12 +1397,7 @@ fn refine_segment_grid_text_rows(
             row.iter_mut()
                 .map(|items| {
                     if crate::text_utils::is_rtl_text(items.iter().map(|item| &item.text)) {
-                        crate::text_utils::sort_rtl_cell_items(
-                            items,
-                            |item| item.x,
-                            |item| item.line_y(),
-                            |item| item.text.as_str(),
-                        );
+                        crate::text_utils::sort_rtl_cell_items(items, |item| *item);
                     } else {
                         items.sort_by(|left, right| left.x.total_cmp(&right.x));
                     }
@@ -2144,6 +2139,12 @@ mod tests {
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
             rotation: 0.0,

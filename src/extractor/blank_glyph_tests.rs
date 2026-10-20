@@ -17,7 +17,7 @@ enum Cmap {
 /// A minimal TrueType font: `head`, `hhea`, `maxp`, `hmtx`, `loca`, `glyf`
 /// and a (1,0) format 0 `cmap`. Glyph 0 is `.notdef`; each entry in
 /// `glyphs` is `(outlined, advance)`, mapped from `codes[i]`.
-fn synthetic_truetype(glyphs: &[(bool, u16)], codes: &[u8]) -> Vec<u8> {
+pub(crate) fn synthetic_truetype(glyphs: &[(bool, u16)], codes: &[u8]) -> Vec<u8> {
     synthetic_truetype_with(glyphs, codes, Cmap::MacRoman)
 }
 
@@ -277,6 +277,22 @@ fn synthetic_truetype_parses_with_the_intended_outlines() {
 fn blank_glyph_reads_as_space_despite_stale_tounicode() {
     let (mut doc, _) = doc_with_font(WORD_FOR_MAC, CODES, Some(STALE_TOUNICODE), None, CONTENT);
     assert_eq!(text_of(&mut doc), "3r r3");
+}
+
+/// A blank glyph with an advance at a code whose ToUnicode entry is a
+/// control destination reads as the space the glyph paints, as the same
+/// glyph of a composite font does: the entry names no text, no name or
+/// encoding reads the code, and a nameless blank glyph with an advance is a
+/// gap — nothing is hidden, and no encoding issue is reported.
+#[test]
+fn blank_glyph_at_a_control_destination_reads_as_a_space() {
+    let tounicode = STALE_TOUNICODE.replace("<24><0024>", "<24><0003>");
+    let (mut doc, _) = doc_with_font(WORD_FOR_MAC, CODES, Some(&tounicode), None, CONTENT);
+    assert_eq!(text_of(&mut doc), "3r r3");
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let result = crate::process_pdf_mem(&bytes).unwrap();
+    assert!(!result.has_encoding_issues);
 }
 
 #[test]
