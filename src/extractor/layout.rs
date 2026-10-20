@@ -2954,6 +2954,37 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
     chaos_ratio > 0.4
 }
 
+fn line_font_size(line: &TextLine) -> f32 {
+    line.items.iter().map(|i| i.font_size).fold(0.0, f32::max)
+}
+
+fn line_x_range(line: &TextLine) -> (f32, f32) {
+    line.items.iter().fold((f32::MAX, f32::MIN), |(x0, x1), i| {
+        (x0.min(i.x), x1.max(i.x + i.width))
+    })
+}
+
+/// The line, among the few just before the current one, that `item`
+/// continues on the same baseline right where that line's text ends.
+/// The look-back stays short so distant same-baseline columns never merge.
+fn deferred_fragment_line<'a>(
+    lines: &'a mut [TextLine],
+    item: &TextItem,
+) -> Option<&'a mut TextLine> {
+    let len = lines.len();
+    lines[len.saturating_sub(3)..len.saturating_sub(1)]
+        .iter_mut()
+        .rev()
+        .find(|line| {
+            let (_, end) = line_x_range(line);
+            let gap = item.x - end;
+            line.page == item.page
+                && (line.y - item.line_y()).abs() < 0.5
+                && gap > -1.0
+                && gap <= item.font_size
+        })
+}
+
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
 /// `page_rtl` is the direction of the page the column belongs to, which
@@ -2982,12 +3013,13 @@ fn group_single_column(
         items
     };
 
+    let y_tolerance = 3.0;
+
     // Group items into lines. Baselines are compared through `line_y`, which
     // snaps super/subscript runs to the body baseline they belong to; a
     // fixed 3pt window on raw `y` split 4-5pt raised markers into their own
     // orphan "line".
     let mut lines: Vec<TextLine> = Vec::new();
-    let y_tolerance = 3.0;
 
     for item in items {
         // Only check the most recent line for merging
@@ -3075,6 +3107,10 @@ fn group_single_column(
         if should_merge {
             // Add to the most recent line
             lines.last_mut().unwrap().items.push(item);
+        } else if let Some(line) = deferred_fragment_line(&mut lines, &item) {
+            // A run painted after the next line but continuing an earlier
+            // line exactly where it ended (W-4 sidebar "card? If not, ...").
+            line.items.push(item);
         } else {
             // Create new line
             let y = item.line_y();
@@ -3085,6 +3121,28 @@ fn group_single_column(
                 page,
                 adaptive_threshold,
             });
+        }
+    }
+
+    // An indented first line painted after its second line shows up as one
+    // isolated upward step of about one line height inside a downward flow.
+    // Swap only that pair; bottom-up runs (axis labels) and larger jumps
+    // between regions keep their stream order.
+    for k in 0..lines.len().saturating_sub(1) {
+        let (a, b) = (&lines[k], &lines[k + 1]);
+        if a.page != b.page {
+            continue;
+        }
+        let rise = b.y - a.y;
+        let size = line_font_size(a).max(line_font_size(b));
+        let ((a0, a1), (b0, b1)) = (line_x_range(a), line_x_range(b));
+        let overlaps = a0.max(b0) < a1.min(b1);
+        let above_prev = k == 0 || lines[k - 1].page != b.page || lines[k - 1].y > b.y;
+        let below_next = lines
+            .get(k + 2)
+            .is_none_or(|n| n.page != a.page || n.y < a.y);
+        if rise > 0.5 && rise <= size * 1.6 && overlaps && above_prev && below_next {
+            lines.swap(k, k + 1);
         }
     }
 
@@ -3536,6 +3594,53 @@ mod tests {
             y -= 14.0;
         }
         items
+    }
+
+    #[test]
+    fn single_column_reorders_indented_lines_without_large_jumps() {
+        let items = vec![
+            make_item(1, 316.8, 167.26, "continuation of the paragraph"),
+            make_item(1, 324.8, 176.26, "Beginning of the paragraph"),
+            make_item(1, 316.8, 158.26, "final paragraph line"),
+        ];
+        let lines = group_single_column(items, 0.10, false);
+        let texts: Vec<_> = lines
+            .iter()
+            .flat_map(|line| line.items.iter().map(|item| item.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Beginning of the paragraph",
+                "continuation of the paragraph",
+                "final paragraph line",
+            ]
+        );
+    }
+
+    #[test]
+    fn single_column_joins_deferred_inline_fragment_before_next_line() {
+        let mut label = make_item(1, 479.2, 661.48, "Label?");
+        label.width = 18.93;
+        let items = vec![
+            label,
+            make_item(1, 479.2, 653.98, "continuation on the next line"),
+            make_item(1, 498.13, 661.48, "Same-line explanation"),
+            make_item(1, 479.2, 646.48, "last line"),
+        ];
+        let lines = group_single_column(items, 0.10, false);
+        let texts: Vec<Vec<_>> = lines
+            .iter()
+            .map(|line| line.items.iter().map(|item| item.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                vec!["Label?", "Same-line explanation"],
+                vec!["continuation on the next line"],
+                vec!["last line"],
+            ]
+        );
     }
 
     #[test]
