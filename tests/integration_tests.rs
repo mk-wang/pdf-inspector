@@ -1335,6 +1335,9 @@ fn test_snapshot_real_estate_pricing() {
 
 #[test]
 fn test_snapshot_2013_app2() {
+    // The fixture's page tree lists a kid (27 0 R) that does not exist.
+    // lopdf keeps that slot as a blank page, so the November and December
+    // tables are separated by a real page boundary instead of merging.
     assert_snapshot("2013-app2");
 }
 
@@ -1373,6 +1376,17 @@ fn test_2013_app2_table_semantics() {
             "Euro267,537.60",
         ]),
         "missing complete row 234:\n{markdown}"
+    );
+    assert!(
+        has_table_row(&[
+            "298",
+            "17/12",
+            "Renovation of Glacis Health Centre-Variations",
+            "MOH",
+            "F & P Construction",
+            "SR400,000.00",
+        ]),
+        "missing complete row 298 at the table boundary:\n{markdown}"
     );
     assert!(
         has_table_row(&["", "NOV", "", "", "", ""]),

@@ -365,7 +365,13 @@ fn prepare_markdown_state(
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
     let page_boxes = collect_page_boxes(doc);
 
-    if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
+    // Scanned means no text operators at all: there is nothing to extract, so
+    // skip the extraction pipeline. ImageBased is only an OCR *routing hint*
+    // with "minimal/no text" (see `PdfType`); a page can still carry native
+    // text next to a signature, figure, or full-page raster. Running the
+    // bounded extraction below lets that text survive, while the retained
+    // ImageBased classification keeps requesting OCR for the pages it needs.
+    if pdf_type == PdfType::Scanned {
         return Ok(PreparedMarkdown {
             pdf_type,
             page_count,
@@ -417,7 +423,7 @@ fn prepare_markdown_state(
             Err(_) => true,
         };
 
-        if pdf_type == PdfType::Mixed || !selection_has_visible_text {
+        if matches!(pdf_type, PdfType::Mixed | PdfType::ImageBased) || !selection_has_visible_text {
             match result {
                 Ok(((items, rects, lines), thresholds, gid_encoded_pages)) => {
                     // `[Image: …]` items (ItemType::Image) are placeholders for
@@ -470,7 +476,16 @@ fn prepare_markdown_state(
 
     let extracted = match extracted {
         Ok(extracted) => Some(extracted),
-        Err(error) if pdf_type == PdfType::Mixed && !error.is_decompression_limit() => None,
+        // Mixed already degraded to an OCR-only result when native extraction
+        // failed for a non-limit reason; ImageBased now runs the same
+        // extraction, so it must degrade the same way. Decompression-limit
+        // failures still propagate for every type.
+        Err(error)
+            if matches!(pdf_type, PdfType::Mixed | PdfType::ImageBased)
+                && !error.is_decompression_limit() =>
+        {
+            None
+        }
         Err(error) => return Err(error),
     };
 
@@ -593,15 +608,16 @@ fn prepare_markdown_state(
         (pdf_type, rendered.markdown, confidence)
     };
 
-    let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
-        && markdown
-            .as_ref()
-            .is_some_and(|markdown| is_garbage_text(markdown))
-    {
-        (None, true, true)
-    } else {
-        (markdown, rendered.has_encoding_issues, false)
-    };
+    let (markdown, has_encoding_issues, force_ocr_all) =
+        if matches!(pdf_type, PdfType::TextBased | PdfType::ImageBased)
+            && markdown
+                .as_ref()
+                .is_some_and(|markdown| is_garbage_text(markdown))
+        {
+            (None, true, pdf_type == PdfType::TextBased)
+        } else {
+            (markdown, rendered.has_encoding_issues, false)
+        };
 
     let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
     if force_ocr_all {
@@ -1254,5 +1270,166 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, HybridMarkdownError::InvalidToken { .. }));
+    }
+
+    /// One page with an image XObject `/Im0` painted by `image_ops`, plus
+    /// optional native text lines. Serialized through the real
+    /// `process_pdf_mem` entry point.
+    fn image_text_document(image: (i64, i64), image_ops: &str, text_lines: &[&str]) -> Document {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let page_id = document.new_object_id();
+        let font_id = document.new_object_id();
+        let image_id = document.new_object_id();
+        let content_id = document.new_object_id();
+
+        document.objects.insert(
+            font_id,
+            dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+            }
+            .into(),
+        );
+        document.objects.insert(
+            image_id,
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => image.0,
+                    "Height" => image.1,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 1,
+                },
+                vec![255; (image.0 as usize).div_ceil(8) * image.1 as usize],
+            )
+            .into(),
+        );
+
+        let mut content = format!("{image_ops}BT /F1 12 Tf 72 700 Td ").into_bytes();
+        for line in text_lines {
+            content.extend_from_slice(format!("({line}) Tj 0 -14 Td ").as_bytes());
+        }
+        content.extend_from_slice(b"ET");
+        document
+            .objects
+            .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+        document.objects.insert(
+            page_id,
+            dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => font_id },
+                    "XObject" => dictionary! { "Im0" => image_id },
+                },
+                "Contents" => content_id,
+            }
+            .into(),
+        );
+        document.objects.insert(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }
+            .into(),
+        );
+        let catalog_id = document.new_object_id();
+        document.objects.insert(
+            catalog_id,
+            dictionary! { "Type" => "Catalog", "Pages" => pages_id }.into(),
+        );
+        document.trailer.set("Root", catalog_id);
+        document
+    }
+
+    fn process_document_result(mut document: Document) -> PdfProcessResult {
+        document.compress();
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("serialize test PDF");
+        crate::process_pdf_mem(&bytes).expect("process test PDF")
+    }
+
+    #[test]
+    fn process_pdf_mem_preserves_native_text_on_signed_image_page() {
+        // A 2000x1000 signature bitmap (large bitmap, small and clipped on the
+        // page) added twice must not erase text the document already had.
+        let result = process_document_result(image_text_document(
+            (2000, 1000),
+            "q 96 0 0 60 72 620 cm 0 0 96 60 re W n /Im0 Do Q \
+             q 96 0 0 60 300 620 cm 0 0 96 60 re W n /Im0 Do Q ",
+            &["SOURCE VECTOR TEXT"],
+        ));
+
+        // Classification is retained: the page is still an OCR routing hint.
+        assert_eq!(result.pdf_type, PdfType::ImageBased);
+        let markdown = result
+            .markdown
+            .expect("native text must survive a signature image");
+        assert!(
+            markdown.contains("SOURCE VECTOR TEXT"),
+            "expected retained native text, got {markdown:?}"
+        );
+        assert!(
+            result.pages_needing_ocr.contains(&1),
+            "ImageBased must still request OCR, got {:?}",
+            result.pages_needing_ocr
+        );
+    }
+
+    #[test]
+    fn process_pdf_mem_keeps_native_fragment_and_ocr_request_for_image_page() {
+        let result = process_document_result(image_text_document(
+            (1000, 1400),
+            "q 612 0 0 792 0 0 cm /Im0 Do Q ",
+            &["NATIVE FRAGMENT"],
+        ));
+
+        assert_eq!(result.pdf_type, PdfType::ImageBased);
+        let markdown = result
+            .markdown
+            .expect("image-backed native fragment must be returned");
+        assert!(
+            markdown.contains("NATIVE FRAGMENT"),
+            "expected native fragment, got {markdown:?}"
+        );
+        assert!(result.pages_needing_ocr.contains(&1));
+    }
+
+    #[test]
+    fn process_pdf_mem_rejects_garbled_image_page_text_without_losing_ocr_route() {
+        let garbled = "!!??::;;==++@@%% ".repeat(8);
+        let result = process_document_result(image_text_document(
+            (1000, 1400),
+            "q 612 0 0 792 0 0 cm /Im0 Do Q ",
+            &[&garbled],
+        ));
+
+        assert_eq!(result.pdf_type, PdfType::ImageBased);
+        assert!(result.markdown.is_none());
+        assert!(result.has_encoding_issues);
+        assert_eq!(result.pages_needing_ocr, vec![1]);
+    }
+
+    #[test]
+    fn process_pdf_mem_pure_scan_stays_none() {
+        let result = process_document_result(image_text_document(
+            (1000, 1400),
+            "q 612 0 0 792 0 0 cm /Im0 Do Q ",
+            &[],
+        ));
+
+        assert_eq!(result.pdf_type, PdfType::Scanned);
+        assert!(
+            result.markdown.is_none(),
+            "a pure scan must not claim native markdown"
+        );
+        assert_eq!(result.pages_needing_ocr, vec![1]);
     }
 }

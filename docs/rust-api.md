@@ -108,6 +108,14 @@ let result = process_pdf_with_options(
 )?;
 ```
 
+`PdfOptions::max_decompressed_size(limit)` caps each decoded stream and cumulative decoded `ObjStm`
+and `XRef` bytes during loading. Repair and password retries preserve `PdfError::DecompressionLimit`.
+Without an explicit value, loading retains its legacy 8 MiB per-stream limit without an aggregate cap.
+These decoded-byte limits do not establish a peak resident-memory bound.
+
+`ImageBased` is an OCR routing hint, not proof that native text is absent. Full processing preserves
+usable native Markdown alongside OCR requests. Pure `Scanned` documents retain the empty native-text fast path.
+
 Process from a byte buffer (no filesystem needed):
 
 ```rust

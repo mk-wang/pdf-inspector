@@ -252,8 +252,9 @@ pub struct PdfOptions {
     /// Password for decrypting an encrypted PDF. `None` falls back to the
     /// empty password (owner-only encryption).
     pub password: Option<String>,
-    /// Maximum number of bytes any one PDF stream may decompress to while loading.
-    /// `None` keeps lopdf's default unbounded behavior.
+    /// Explicit stream decode limit. During loading it also caps the aggregate
+    /// bytes decoded from xref and object streams. `None` retains the loader's
+    /// legacy 8 MiB per-stream default without an aggregate cap.
     pub max_decompressed_size: Option<usize>,
 }
 
@@ -329,7 +330,7 @@ impl PdfOptions {
         self
     }
 
-    /// Bound the decompressed size of each PDF stream while loading.
+    /// Bound each stream and the aggregate decoded container bytes during loading.
     pub fn max_decompressed_size(mut self, max_decompressed_size: usize) -> Self {
         self.max_decompressed_size = Some(max_decompressed_size);
         self
@@ -4161,6 +4162,9 @@ fn load_document_from_mem_with_password_and_limit(
     let doc = match load_document_bytes(buf, password, max_decompressed_size) {
         Ok(doc) => doc,
         Err(first_err) => {
+            if is_decompression_limit_error(&first_err) {
+                return Err(first_err.into());
+            }
             for repaired in repair_pdf_container_candidates(buf) {
                 match load_document_bytes(&repaired, password, max_decompressed_size) {
                     Ok(doc) => {
@@ -4168,7 +4172,8 @@ fn load_document_from_mem_with_password_and_limit(
                         return finish_loaded_document(doc);
                     }
                     Err(error) => {
-                        if is_encrypted_lopdf_error(&error) {
+                        if is_encrypted_lopdf_error(&error) || is_decompression_limit_error(&error)
+                        {
                             return Err(error.into());
                         }
                     }
@@ -4227,6 +4232,7 @@ const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 fn bounded_load_options(max_decompressed_size: Option<usize>) -> lopdf::LoadOptions {
     lopdf::LoadOptions {
         max_decompressed_size: max_decompressed_size.or(Some(MAX_STREAM_DECOMPRESSED_BYTES)),
+        max_total_decompressed_size: max_decompressed_size,
         ..Default::default()
     }
 }
@@ -4242,9 +4248,11 @@ fn load_document_bytes(
 ) -> Result<Document, lopdf::Error> {
     let supplied = password.unwrap_or("");
     match load_document_bytes_with_credential(buf, Some(supplied), max_decompressed_size) {
-        Err(first) if !supplied.is_empty() => {
-            load_document_bytes_with_credential(buf, Some(""), max_decompressed_size)
-                .map_err(|_| first)
+        Err(first) if !supplied.is_empty() && !is_decompression_limit_error(&first) => {
+            match load_document_bytes_with_credential(buf, Some(""), max_decompressed_size) {
+                Err(error) if is_decompression_limit_error(&error) => Err(error),
+                result => result.map_err(|_| first),
+            }
         }
         result => result,
     }

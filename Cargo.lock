@@ -1406,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "lopdf"
 version = "0.45.0"
-source = "git+https://github.com/mk-wang/lopdf.git?rev=e32e841b08c54982c9e3f1a3cd38cf6aceeea4bc#e32e841b08c54982c9e3f1a3cd38cf6aceeea4bc"
+source = "git+https://github.com/mk-wang/lopdf.git?rev=5d196e104ee6338e2b3ff24769beae5d793d8af8#5d196e104ee6338e2b3ff24769beae5d793d8af8"
 dependencies = [
  "aes",
  "bitflags 2.13.1",
